@@ -145,6 +145,27 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect("isolates an explicit profile even when the original legacy profile exists", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(yield* identity.resolveUserDataPath, "/personal/electron-profile");
+        yield* identity.configure;
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        assert.equal(environment.displayName, "T3 Code Personal");
+      }),
+      {
+        legacyPathExists: true,
+        environment: {
+          env: {
+            T3CODE_DESKTOP_USER_DATA_DIR: " /personal/electron-profile ",
+            T3CODE_DESKTOP_APP_NAME: " T3 Code Personal ",
+          },
+        },
+      },
+    ),
+  );
+
   it.effect("keeps using the legacy userData path when it already exists", () =>
     withIdentity(
       Effect.gen(function* () {
