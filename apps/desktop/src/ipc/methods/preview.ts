@@ -1,4 +1,5 @@
 import {
+  DesktopPreviewDevtoolsInputSchema,
   DesktopPreviewAnnotationThemeInputSchema,
   DesktopPreviewArtifactInputSchema,
   DesktopPreviewAutomationClickInputSchema,
@@ -412,6 +413,23 @@ export const automationSnapshot = DesktopIpc.makeIpcMethod({
   }),
 });
 
+export const automationDevtools = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.PREVIEW_AUTOMATION_DEVTOOLS_CHANNEL,
+  payload: DesktopPreviewDevtoolsInputSchema,
+  result: Schema.Unknown,
+  handler: Effect.fn("desktop.ipc.preview.automationDevtools")(function* ({ tabId, input }) {
+    const manager = yield* PreviewManager.PreviewManager;
+    return yield* manager.automationDevtools(tabId, input).pipe(
+      Effect.catchTag("PreviewDevtoolsError", (error) =>
+        Effect.succeed({
+          _tag: "PreviewDevtoolsFailure" as const,
+          detail: error.detail.slice(0, 1024),
+        }),
+      ),
+    );
+  }),
+});
+
 export const automationClick = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.PREVIEW_AUTOMATION_CLICK_CHANNEL,
   payload: DesktopPreviewAutomationClickInputSchema,
@@ -510,6 +528,7 @@ export const methods = [
   closePictureInPicture,
   automationStatus,
   automationSnapshot,
+  automationDevtools,
   automationClick,
   automationType,
   automationPress,

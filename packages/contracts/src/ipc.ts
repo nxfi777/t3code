@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 
+import { PreviewDevtoolsInput } from "./previewDevtools.ts";
 import {
   PreviewAutomationClickInput,
   PreviewAutomationEvaluateInput,
@@ -1109,6 +1110,11 @@ export const DesktopPreviewAutomationEvaluateInputSchema = Schema.Struct({
   input: PreviewAutomationEvaluateInput,
 });
 
+export const DesktopPreviewDevtoolsInputSchema = Schema.Struct({
+  tabId: Schema.String,
+  input: PreviewDevtoolsInput,
+});
+
 export const DesktopPreviewAutomationWaitForInputSchema = Schema.Struct({
   tabId: DesktopPreviewTabIdSchema,
   input: PreviewAutomationWaitForInput,
@@ -1338,6 +1344,7 @@ export interface DesktopPreviewBridge {
     onFrame: (listener: (frame: DesktopPreviewRecordingFrame) => void) => () => void;
   };
   automation: {
+    devtools?: (tabId: string, input: PreviewDevtoolsInput) => Promise<unknown>;
     status: (tabId: string) => Promise<DesktopPreviewAutomationStatus>;
     snapshot: (tabId: string) => Promise<PreviewAutomationSnapshot>;
     click: (tabId: string, input: PreviewAutomationClickInput) => Promise<void>;

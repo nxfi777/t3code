@@ -6,6 +6,8 @@
  * here). Single layer-scoped browser session partition.
  */
 import * as NodeCrypto from "node:crypto";
+import * as Devtools from "./Devtools.ts";
+import type { PreviewDevtoolsInput } from "@t3tools/contracts";
 import {
   DesktopPreviewRecordingInputSchema,
   DESKTOP_PREVIEW_RECORDING_CAPTURE_TRIGGER,
@@ -521,7 +523,16 @@ interface ExpectedAgentInput {
 const POPUP_PROTOCOLS = new Set(["http:", "https:"]);
 
 /** Control actions that only read the page, so they do not make it agent-driven. */
-const READ_ONLY_CONTROL_ACTIONS = new Set(["snapshot", "waitFor"]);
+const READ_ONLY_CONTROL_ACTIONS = new Set([
+  "snapshot",
+  "waitFor",
+  "devtools.console",
+  "devtools.network",
+  "devtools.request",
+  "devtools.styles",
+  "devtools.memory",
+  "devtools.artifactRead",
+]);
 
 const isPopupUrl = (rawUrl: string): boolean => {
   try {
@@ -644,6 +655,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
   const resolvedArtifactDirectory = path.resolve(artifactDirectory);
+  const devtools = yield* Devtools.make(resolvedArtifactDirectory);
   const playwrightInstallExpression = yield* Effect.cached(
     playwrightInjectedRuntimeInstallExpression(),
   );
@@ -1325,6 +1337,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
             method: string,
             params: Record<string, unknown>,
           ) {
+            yield* devtools.capture(wc.id, method, params);
             if (method === "Page.screencastFrame") {
               const sessionId = params["sessionId"];
               if (typeof sessionId === "number") {
@@ -1373,20 +1386,31 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           };
           yield* Scope.addFinalizer(
             scope,
-            Effect.all(
-              [
-                Ref.update(diagnosticsRef, (diagnostics) =>
-                  replaceMap(diagnostics, (copy) => {
-                    copy.delete(wc.id);
-                  }),
+            devtools
+              .detach(wc.id, (method, params) =>
+                attemptPromise(
+                  { operation: `devtools.cleanup.${method}`, webContentsId: wc.id },
+                  () => wcDebugger.sendCommand(method, params),
                 ),
-                attempt({ operation: "detachControlSession", webContentsId: wc.id }, () => {
-                  wcDebugger.off("message", onMessage);
-                  if (wcDebugger.isAttached()) wcDebugger.detach();
-                }).pipe(Effect.ignore),
-              ],
-              { discard: true },
-            ),
+              )
+              .pipe(
+                Effect.andThen(
+                  Effect.all(
+                    [
+                      Ref.update(diagnosticsRef, (diagnostics) =>
+                        replaceMap(diagnostics, (copy) => {
+                          copy.delete(wc.id);
+                        }),
+                      ),
+                      attempt({ operation: "detachControlSession", webContentsId: wc.id }, () => {
+                        wcDebugger.off("message", onMessage);
+                        if (wcDebugger.isAttached()) wcDebugger.detach();
+                      }).pipe(Effect.ignore),
+                    ],
+                    { discard: true },
+                  ),
+                ),
+              ),
           );
           const control: BrowserControlSession = {
             webContentsId: wc.id,
@@ -1396,6 +1420,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
             onMessage,
           };
           const initialize = Effect.fn("PreviewManager.initializeControlSession")(function* () {
+            yield* devtools.attach(wc.id);
             yield* Ref.update(diagnosticsRef, (diagnostics) =>
               replaceMap(diagnostics, (copy) => {
                 copy.set(wc.id, {
@@ -1414,7 +1439,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
               (method) =>
                 attemptPromise(
                   { operation: `initializeDebugger.${method}`, webContentsId: wc.id },
-                  () => wcDebugger.sendCommand(method),
+                  () =>
+                    wcDebugger.sendCommand(
+                      method,
+                      method === "Network.enable"
+                        ? {
+                            maxTotalBufferSize: 4 * 1024 * 1024,
+                            maxResourceBufferSize: 64 * 1024,
+                            maxPostDataSize: 0,
+                          }
+                        : undefined,
+                    ),
                 ),
               { concurrency: "unbounded", discard: true },
             );
@@ -3815,6 +3850,16 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     );
   });
 
+  const automationDevtools = Effect.fn("PreviewManager.automationDevtools")(function* (
+    tabId: string,
+    input: PreviewDevtoolsInput,
+  ) {
+    const wc = yield* requireWebContents(tabId);
+    return yield* withControlSession(tabId, wc, `devtools.${input.action}`, (send, cleanup) =>
+      devtools.run(wc.id, input, send, cleanup),
+    );
+  });
+
   const resolveClickPoint = Effect.fn("PreviewManager.resolveClickPoint")(function* (
     tabId: string,
     send: SendCommand,
@@ -4659,6 +4704,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     automationPress,
     automationScroll,
     automationSnapshot,
+    automationDevtools,
     automationStatus,
     automationType,
     automationWaitFor,
@@ -4964,6 +5010,7 @@ export class PreviewAutomationControlInterruptedError extends Schema.TaggedError
 }
 
 export const PreviewManagerError = Schema.Union([
+  Devtools.PreviewDevtoolsError,
   PreviewTabNotFoundError,
   PreviewWebContentsNotFoundError,
   PreviewWebviewNotInitializedError,
@@ -5072,6 +5119,10 @@ export class PreviewManager extends Context.Service<
     readonly automationSnapshot: (
       tabId: string,
     ) => Effect.Effect<PreviewAutomationSnapshot, PreviewManagerError>;
+    readonly automationDevtools: (
+      tabId: string,
+      input: PreviewDevtoolsInput,
+    ) => Effect.Effect<unknown, PreviewManagerError>;
     readonly automationClick: (
       tabId: string,
       input: PreviewAutomationClickInput,
@@ -5189,6 +5240,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     saveRecording: operations.saveRecording,
     automationStatus: operations.automationStatus,
     automationSnapshot: operations.automationSnapshot,
+    automationDevtools: operations.automationDevtools,
     automationClick: operations.automationClick,
     automationType: operations.automationType,
     automationPress: operations.automationPress,

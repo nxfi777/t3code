@@ -367,6 +367,8 @@ contextBridge.exposeInMainWorld("desktopBridge", {
       },
     },
     automation: {
+      devtools: (tabId, input) =>
+        ipcRenderer.invoke(IpcChannels.PREVIEW_AUTOMATION_DEVTOOLS_CHANNEL, { tabId, input }),
       status: (tabId) =>
         ipcRenderer.invoke(IpcChannels.PREVIEW_AUTOMATION_STATUS_CHANNEL, { tabId }),
       snapshot: (tabId) =>

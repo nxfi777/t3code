@@ -1,6 +1,9 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
+import * as Layer from "effect/Layer";
+import type { PreviewDevtoolsInput } from "@t3tools/contracts";
+import * as Devtools from "../../../preview/Devtools.ts";
 import {
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PREVIEW_RECORDING_STOP_TIMEOUT_MS,
@@ -187,7 +190,22 @@ export const claimPreviewRecording = Effect.fn("PreviewToolkit.claimRecording")(
   return { ...recording, id: finalId, path: finalPath };
 });
 
+const invokeDevtools = (input: PreviewDevtoolsInput) =>
+  Effect.gen(function* () {
+    const scope = yield* McpInvocationContext.requireMcpCapability("preview");
+    const service = yield* Devtools.PreviewDevtools;
+    return { data: yield* service.invoke(scope, input) };
+  });
+
 const handlers = {
+  preview_console: (input) => invokeDevtools({ ...input, action: "console" }),
+  preview_network: (input) => invokeDevtools({ ...input, action: "network" }),
+  preview_network_request: (input) => invokeDevtools({ ...input, action: "request" }),
+  preview_styles: (input) => invokeDevtools({ ...input, action: "styles" }),
+  preview_emulate: (input) => invokeDevtools({ ...input, action: "emulate" }),
+  preview_performance_start: (input) => invokeDevtools({ ...input, action: "traceStart" }),
+  preview_performance_stop: (input) => invokeDevtools({ ...input, action: "traceStop" }),
+  preview_memory: (input) => invokeDevtools({ ...input, action: "memory" }),
   preview_status: (input) => invokeTargeted<PreviewAutomationStatus>("status", input ?? {}),
   preview_open: (input) =>
     invokeTargeted<PreviewAutomationStatus>("open", normalizePreviewOpenInput(input)),
@@ -233,7 +251,9 @@ const handlers = {
 
 const { preview_snapshot, ...standardHandlers } = handlers;
 
-export const PreviewStandardToolkitHandlersLive = PreviewStandardToolkit.toLayer(standardHandlers);
+export const PreviewStandardToolkitHandlersLive = PreviewStandardToolkit.toLayer(
+  standardHandlers,
+).pipe(Layer.provide(Devtools.layer));
 
 export const PreviewSnapshotToolkitHandlersLive = PreviewSnapshotToolkit.toLayer({
   preview_snapshot,

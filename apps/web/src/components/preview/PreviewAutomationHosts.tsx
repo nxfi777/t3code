@@ -325,7 +325,10 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
     () => ({
       clientId: automationClientId,
       environmentId,
-      supportedOperations: [...PREVIEW_AUTOMATION_OPERATIONS],
+      supportedOperations: PREVIEW_AUTOMATION_OPERATIONS.filter(
+        (operation) =>
+          operation !== "devtools" || typeof previewBridge?.automation.devtools === "function",
+      ),
     }),
     [automationClientId, environmentId],
   );
@@ -683,6 +686,15 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
           case "snapshot": {
             const ready = await requireReadyTab();
             return await ready.bridge.automation.snapshot(ready.runtimeTabId);
+          }
+          case "devtools": {
+            const ready = await requireReadyTab();
+            if (!ready.bridge.automation.devtools)
+              throw new Error("Update the desktop app to use browser DevTools.");
+            return await ready.bridge.automation.devtools(
+              ready.runtimeTabId,
+              request.input as Parameters<NonNullable<typeof ready.bridge.automation.devtools>>[1],
+            );
           }
           case "click": {
             const ready = await requireReadyTab();
