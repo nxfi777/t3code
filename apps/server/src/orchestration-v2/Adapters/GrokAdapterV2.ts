@@ -55,6 +55,7 @@ import {
 } from "../../provider/acp/XAiAcpExtension.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { acpPermissionDisposition } from "../../provider/acp/AcpClientPolicy.ts";
+import { grokNativeHistory } from "../../provider/acp/GrokAcpHistory.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -88,8 +89,8 @@ export const GrokProviderCapabilitiesV2 = {
   threads: {
     ...AcpProviderCapabilitiesV2.threads,
     canReadThreadSnapshot: true,
-    canForkThread: false,
-    canForkFromTurn: false,
+    canForkThread: true,
+    canForkFromTurn: true,
   },
   subagents: {
     ...AcpProviderCapabilitiesV2.subagents,
@@ -234,6 +235,7 @@ export function makeGrokAcpAdapterFlavor(options: GrokAdapterV2Options): AcpAdap
     driver: GROK_PROVIDER,
     runtimeHarness: "Grok",
     capabilities: GrokProviderCapabilitiesV2,
+    nativeHistory: grokNativeHistory,
     interruptPromptOnCancel: false,
     // User Stop (requestRuntimeRestart) still hard-kills the process group and
     // respawns so existing background tasks stop too. Older 0.2.x builds could

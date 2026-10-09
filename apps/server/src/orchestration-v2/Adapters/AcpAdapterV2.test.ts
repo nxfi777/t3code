@@ -604,6 +604,222 @@ function makeTurnInput(input: {
 }
 
 describe("AcpAdapterV2", () => {
+  it.live.each([false, true])("Grok native history support is negotiated (%s)", (supported) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const instanceId = ProviderInstanceId.make("grok-history-test");
+      const threadId = ThreadId.make("grok-history-source");
+      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+      const mockRuntime = makeMockRuntime({
+        childProcessSpawner,
+        mockAgentPath: yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        ),
+        protocolEvents,
+        environment: (runtimeOrdinal) => ({
+          T3_ACP_GROK_NATIVE_HISTORY: supported ? "1" : "0",
+          T3_ACP_GROK_INITIAL_PROMPT_COUNT: runtimeOrdinal === 1 ? "5" : "7",
+        }),
+      });
+      const adapter = makeGrokAdapterV2({
+        instanceId,
+        settings: DEFAULT_GROK_SETTINGS,
+        environment: {},
+        hostPlatform: yield* HostProcessPlatform,
+        childProcessSpawner,
+        crypto: yield* Crypto.Crypto,
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        serverConfig: yield* ServerConfig.ServerConfig,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          mockRuntime(input).pipe(Effect.flatMap(makeXAiPromptCompletionRuntime)),
+      });
+      const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "grok-build" } as const;
+      const firstRuntimeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstRuntimeScope, Exit.void));
+      let runtime = yield* adapter
+        .openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("grok-history-runtime"),
+          initialNativeThreadId: "native-source",
+          runtimePolicy,
+          modelSelection,
+        })
+        .pipe(Effect.provideService(Scope.Scope, firstRuntimeScope));
+      assert.equal(runtime.providerSession.capabilities.threads.canForkFromTurn, supported);
+      assert.equal(runtime.providerSession.capabilities.threads.canRollbackThread, supported);
+      let providerThread = yield* runtime.ensureThread({ threadId, runtimePolicy, modelSelection });
+      if (!supported) {
+        const failed = yield* runtime
+          .rollbackThread({
+            providerThread,
+            providerThreadTurns: [],
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("checkpoint"),
+              appRunOrdinal: 0,
+            },
+          })
+          .pipe(Effect.result);
+        assert.equal(failed._tag, "Failure");
+        return;
+      }
+      const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const turns: Array<import("@t3tools/contracts").OrchestrationV2ProviderTurn> = [];
+      const durableEchoes: Array<import("@t3tools/contracts").OrchestrationV2ProviderTurn> = [];
+      const runTurn = Effect.fnUntraced(function* (ordinal: number) {
+        yield* runtime.startTurn(
+          makeTurnInput({
+            threadId: providerThread.appThreadId ?? threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            ordinal,
+          }),
+        );
+        while (true) {
+          const event = yield* Queue.take(events);
+          if (event.type === "provider_thread.updated") providerThread = event.providerThread;
+          if (
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.status === "running" &&
+            event.providerTurn.nativeTurnRef?.nativeId?.startsWith("grok-prompt-v1:")
+          ) {
+            durableEchoes.push(event.providerTurn);
+          }
+          if (event.type === "provider_turn.updated" && event.providerTurn.status === "completed") {
+            turns.push(event.providerTurn);
+          }
+          if (event.type === "turn.terminal") return;
+        }
+      });
+      yield* runTurn(1);
+      yield* runTurn(2);
+      assert.equal(durableEchoes.length, 2);
+      assert.equal(durableEchoes[0]?.nativeTurnRef?.strength, "weak");
+      assert.equal(turns[0]?.nativeTurnRef?.strength, "strong");
+      const sourceProviderThread = providerThread;
+      assert.include(turns[0]!.nativeTurnRef!.nativeId, '"first":5');
+      const busyFork = yield* runtime
+        .forkThread({
+          sourceProviderThread,
+          sourceProviderTurns: [{ ...turns[1]!, status: "running" }],
+          targetThreadId: ThreadId.make("busy-child"),
+        })
+        .pipe(Effect.result);
+      assert.equal(busyFork._tag, "Failure");
+      yield* Scope.close(firstRuntimeScope, Exit.void);
+      const targetRuntimeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(targetRuntimeScope, Exit.void));
+      runtime = yield* adapter
+        .openSession({
+          threadId: ThreadId.make("grok-history-child"),
+          providerSessionId: ProviderSessionId.make("grok-history-target-runtime"),
+          initialNativeThreadId: "native-target",
+          runtimePolicy,
+          modelSelection,
+        })
+        .pipe(Effect.provideService(Scope.Scope, targetRuntimeScope));
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      providerThread = yield* runtime.forkThread({
+        sourceProviderThread,
+        sourceProviderTurns: turns,
+        providerTurnId: turns[0]!.id,
+        targetThreadId: ThreadId.make("grok-history-child"),
+      });
+      assert.notEqual(
+        providerThread.nativeThreadRef?.nativeId,
+        sourceProviderThread.nativeThreadRef?.nativeId,
+      );
+      assert.equal(providerThread.nativeMetadata?.grokHistoryStartPromptIndex, 6);
+      yield* runTurn(1);
+      const childTurn = turns.at(-1)!;
+      yield* Scope.close(targetRuntimeScope, Exit.void);
+      // Native session storage survives process replacement; T3's saved metadata
+      // must keep the inherited fork prefix through a fresh adapter runtime.
+      runtime = yield* adapter.openSession({
+        threadId: providerThread.appThreadId ?? threadId,
+        providerSessionId: ProviderSessionId.make("replacement-history-runtime"),
+        initialNativeThreadId: providerThread.nativeThreadRef!.nativeId!,
+        runtimePolicy,
+        modelSelection,
+      });
+      providerThread = yield* runtime.resumeThread({
+        providerThread,
+        runtimePolicy,
+        modelSelection,
+      });
+      const rolledBack = yield* runtime.rollbackThread({
+        providerThread,
+        providerThreadTurns: [childTurn],
+        target: {
+          type: "thread_start",
+          checkpointId: CheckpointId.make("checkpoint"),
+          appRunOrdinal: 0,
+        },
+      });
+      assert.equal(
+        rolledBack.providerThread.nativeThreadRef?.nativeId,
+        providerThread.nativeThreadRef?.nativeId,
+      );
+      assert.equal(rolledBack.providerThread.nativeMetadata?.grokHistoryStartPromptIndex, 6);
+      const wire = yield* Queue.takeAll(protocolEvents);
+      const sourceLoads = wire
+        .filter((event) => event.direction === "outgoing")
+        .flatMap((event) => rawProtocolRequest(event) ?? [])
+        .filter(
+          (request) =>
+            (request.method === "session/load" || request.method === "session/resume") &&
+            (request.params as { sessionId?: string }).sessionId === "native-source",
+        );
+      assert.equal(
+        sourceLoads.length,
+        1,
+        "forking in a fresh target runtime must never load the source",
+      );
+      const mutations = wire
+        .filter((event) => event.direction === "outgoing")
+        .flatMap((event) => rawProtocolRequest(event) ?? [])
+        .filter(
+          (request) =>
+            request.method === "_x.ai/session/fork" || request.method === "_x.ai/rewind/execute",
+        )
+        .filter((request) => Object.keys(request.params as object).length > 0);
+      assert.deepEqual(
+        mutations.map((request) => request.params),
+        [
+          {
+            sourceSessionId: "native-source",
+            sourceCwd: process.cwd(),
+            newCwd: process.cwd(),
+            targetPromptIndex: 5,
+          },
+          {
+            sessionId: providerThread.nativeThreadRef?.nativeId,
+            targetPromptIndex: 6,
+            mode: "conversation_only",
+            force: false,
+          },
+        ],
+      );
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.live.each(["failed", "recovered", "completed", "cancelled"] as const)(
     "projects Mistral retry notices and their %s outcome",
     (outcome) =>

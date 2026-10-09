@@ -216,11 +216,66 @@ export interface AcpAdapterV2ExtensionContext {
   readonly lastProposedPlanMarkdown: Effect.Effect<string | undefined>;
 }
 
+export interface AcpAdapterV2NativeHistory {
+  readonly isSupported: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+  ) => Effect.Effect<boolean>;
+  readonly preparePrompt: (
+    prompt: EffectAcpSchema.PromptRequest["prompt"],
+    requestId: string,
+  ) => EffectAcpSchema.PromptRequest["prompt"];
+  readonly initialThreadMetadata: (
+    cwd: string,
+    isNew: boolean,
+  ) => OrchestrationV2ProviderThreadNativeMetadata;
+  readonly captureTurnReference: (input: {
+    readonly current: OrchestrationV2ProviderTurn["nativeTurnRef"];
+    readonly notification: EffectAcpSchema.SessionNotification;
+    readonly requestId?: string;
+  }) => OrchestrationV2ProviderTurn["nativeTurnRef"];
+  readonly finalizeTurnReference: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+    current: OrchestrationV2ProviderTurn["nativeTurnRef"],
+  ) => Effect.Effect<OrchestrationV2ProviderTurn["nativeTurnRef"]>;
+  readonly validateForkSource: (
+    thread: OrchestrationV2ProviderThread,
+    cwd: string,
+  ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
+  readonly rollback: (input: {
+    readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    readonly input: ProviderAdapter.ProviderAdapterV2RollbackThreadInput;
+  }) => Effect.Effect<
+    ReadonlyArray<OrchestrationV2ProviderTurn>,
+    EffectAcpErrors.AcpError | ProviderAdapter.ProviderAdapterProtocolError
+  >;
+  readonly fork: (input: {
+    readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    readonly input: ProviderAdapter.ProviderAdapterV2ForkThreadInput;
+    readonly cwd: string;
+  }) => Effect.Effect<
+    {
+      readonly sessionId: string;
+      readonly nativeMetadata: OrchestrationV2ProviderThreadNativeMetadata;
+    },
+    EffectAcpErrors.AcpError | ProviderAdapter.ProviderAdapterProtocolError
+  >;
+  readonly finalizeForkMetadata: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+    sessionId: string,
+    metadata: OrchestrationV2ProviderThreadNativeMetadata,
+  ) => Effect.Effect<
+    OrchestrationV2ProviderThreadNativeMetadata,
+    EffectAcpErrors.AcpError | ProviderAdapter.ProviderAdapterProtocolError
+  >;
+}
+
 export interface AcpAdapterV2Flavor {
   /** Interprets provider-specific prompt errors before they cross into orchestration. */
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
+  /** Native history extensions are negotiated separately from standard ACP session/fork. */
+  readonly nativeHistory?: AcpAdapterV2NativeHistory;
   readonly clientCapabilitiesMeta?: Record<string, boolean>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
@@ -1165,6 +1220,7 @@ interface ActiveAcpTurn {
     | undefined;
   contextUsage: ThreadTokenUsageSnapshot | null;
   nativeMetadata: OrchestrationV2ProviderThreadNativeMetadata | null;
+  historyTurnRef: OrchestrationV2ProviderTurn["nativeTurnRef"];
   readonly tools: Map<string, AcpToolCallState>;
   /** Streamed tool updates skipped since the last persisted one; see `shouldPersistToolUpdate`. */
   readonly toolUpdatesSkipped: Map<string, number>;
@@ -4520,6 +4576,28 @@ export function makeAcpAdapterV2(
           }
           // Only fresh model output proves a retry recovered; progress on
           // tools and plans that started earlier can arrive mid-retry.
+          if (nativeHistorySupported && flavor.nativeHistory !== undefined) {
+            const previousRef = context.historyTurnRef;
+            context.historyTurnRef = flavor.nativeHistory.captureTurnReference({
+              current: context.historyTurnRef,
+              notification,
+              ...(acpIsProviderContinuationMessage(context.input.message)
+                ? {}
+                : { requestId: context.providerTurnId }),
+            });
+            if (context.historyTurnRef?.nativeId !== previousRef?.nativeId) {
+              const providerTurn = providerTurnPayload(context, "running", null);
+              yield* Ref.update(providerTurns, (current) =>
+                new Map(current).set(String(providerTurn.id), providerTurn),
+              );
+              yield* emitProviderEvent({
+                type: "provider_turn.updated",
+                driver,
+                threadId: context.input.threadId,
+                providerTurn,
+              });
+            }
+          }
           if (
             update.sessionUpdate !== "tool_call_update" &&
             update.sessionUpdate !== "plan" &&
@@ -6234,7 +6312,27 @@ export function makeAcpAdapterV2(
         yield* Ref.set(activeSessionId, started.sessionId);
         yield* Ref.set(activeSessionSetup, started);
         rememberTerminalEnvironment(started.sessionId, input.threadId);
-        const capabilities = negotiatedCapabilities(flavor.capabilities, started);
+        const negotiated = negotiatedCapabilities(flavor.capabilities, started);
+        const nativeHistorySupported =
+          flavor.nativeHistory === undefined
+            ? false
+            : yield* flavor.nativeHistory.isSupported(runtime);
+        const capabilities: OrchestrationV2ProviderCapabilities =
+          flavor.nativeHistory === undefined
+            ? negotiated
+            : {
+                ...negotiated,
+                threads: {
+                  ...negotiated.threads,
+                  canForkThread: nativeHistorySupported,
+                  canForkFromTurn: nativeHistorySupported,
+                  canRollbackThread: nativeHistorySupported,
+                },
+                checkpointing: {
+                  ...negotiated.checkpointing,
+                  providerCanRollbackConversation: nativeHistorySupported,
+                },
+              };
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -6497,7 +6595,7 @@ export function makeAcpAdapterV2(
           providerThreadId: context.input.providerThread.id,
           nodeId: context.input.rootNodeId,
           runAttemptId: context.input.attemptId,
-          nativeTurnRef: {
+          nativeTurnRef: context.historyTurnRef ?? {
             driver,
             nativeId: context.nativeTurnId,
             strength: "weak",
@@ -6628,6 +6726,16 @@ export function makeAcpAdapterV2(
                 updatedAt: now,
               },
             });
+          }
+          if (
+            settledStatus === "completed" &&
+            nativeHistorySupported &&
+            flavor.nativeHistory !== undefined
+          ) {
+            context.historyTurnRef = yield* flavor.nativeHistory.finalizeTurnReference(
+              runtime,
+              context.historyTurnRef,
+            );
           }
           const turn = providerTurnPayload(context, settledStatus, now);
           yield* Ref.update(providerTurns, (current) => {
@@ -7003,6 +7111,7 @@ export function makeAcpAdapterV2(
               reasoning: { current: null, nextSegment: 0 },
               contextUsage: rememberedContextUsage ?? turnInput.providerThread.contextUsage ?? null,
               nativeMetadata: initialNativeMetadata,
+              historyTurnRef: null,
               tools: new Map(),
               toolUpdatesSkipped: new Map(),
               toolStartedAt: new Map(),
@@ -7151,85 +7260,92 @@ export function makeAcpAdapterV2(
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
-            yield* runtime.prompt({ prompt: promptParts!.prompt }).pipe(
-              Effect.tap(() =>
-                Ref.update(promptInstructionStates, (current) => {
-                  if (promptParts?.instructionState === undefined) return current;
-                  const updated = new Map(current);
-                  updated.set(requestedSessionId, promptParts.instructionState);
-                  return updated;
-                }),
-              ),
-              // Wire settlement precedes the completion callback's permit request so
-              // settled-soft classification can observe the native return even when
-              // the completion fiber has not yet set promptSettled under the permit.
-              Effect.tap(() =>
-                Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
-              ),
-              Effect.flatMap((result) =>
-                runRuntimeCallbackAtGeneration(
-                  promptGeneration,
-                  Effect.gen(function* () {
-                    if (context.finalized) return;
-                    const status =
-                      result.stopReason === "cancelled"
-                        ? context.interrupted
-                          ? "interrupted"
-                          : "cancelled"
-                        : "completed";
-                    // Grok monitors (and async subagents) keep working after the root
-                    // prompt RPC returns. Defer finalize so their later updates and
-                    // wake-turn traffic still project onto this run.
-                    if (
-                      flavor.deferFinalizeForBackgroundWork === true &&
-                      !context.interrupted &&
-                      hasDeferredBackgroundWork(context)
-                    ) {
-                      context.promptSettled = true;
-                      context.promptSettledStatus = status;
-                      // The agent finished this prompt's reply. Background work
-                      // holds the run open, not the text it already sent.
-                      yield* closeTextStreams(context);
-                      yield* (
-                        options.testHooks?.afterPromptSettledWithBackgroundWork?.() ?? Effect.void
+            yield* runtime
+              .prompt({
+                prompt:
+                  nativeHistorySupported && flavor.nativeHistory !== undefined
+                    ? flavor.nativeHistory.preparePrompt(promptParts!.prompt, providerTurnId)
+                    : promptParts!.prompt,
+              })
+              .pipe(
+                Effect.tap(() =>
+                  Ref.update(promptInstructionStates, (current) => {
+                    if (promptParts?.instructionState === undefined) return current;
+                    const updated = new Map(current);
+                    updated.set(requestedSessionId, promptParts.instructionState);
+                    return updated;
+                  }),
+                ),
+                // Wire settlement precedes the completion callback's permit request so
+                // settled-soft classification can observe the native return even when
+                // the completion fiber has not yet set promptSettled under the permit.
+                Effect.tap(() =>
+                  Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
+                ),
+                Effect.flatMap((result) =>
+                  runRuntimeCallbackAtGeneration(
+                    promptGeneration,
+                    Effect.gen(function* () {
+                      if (context.finalized) return;
+                      const status =
+                        result.stopReason === "cancelled"
+                          ? context.interrupted
+                            ? "interrupted"
+                            : "cancelled"
+                          : "completed";
+                      // Grok monitors (and async subagents) keep working after the root
+                      // prompt RPC returns. Defer finalize so their later updates and
+                      // wake-turn traffic still project onto this run.
+                      if (
+                        flavor.deferFinalizeForBackgroundWork === true &&
+                        !context.interrupted &&
+                        hasDeferredBackgroundWork(context)
+                      ) {
+                        context.promptSettled = true;
+                        context.promptSettledStatus = status;
+                        // The agent finished this prompt's reply. Background work
+                        // holds the run open, not the text it already sent.
+                        yield* closeTextStreams(context);
+                        yield* (
+                          options.testHooks?.afterPromptSettledWithBackgroundWork?.() ?? Effect.void
+                        );
+                        return;
+                      }
+                      yield* finalizeTurn(context, status);
+                    }),
+                  ).pipe(Effect.asVoid),
+                ),
+                // Prompt failure is not wire-settled: only a successful resolve marks
+                // the signal. catchCause must not complete promptWireSettled.
+                Effect.catchCause((cause) =>
+                  runRuntimeCallbackAtGeneration(
+                    promptGeneration,
+                    Effect.gen(function* () {
+                      if (context.finalized) return;
+                      yield* finalizeTurn(
+                        context,
+                        context.interrupted ? "interrupted" : "failed",
+                        flavor.promptFailure?.(Cause.squash(cause)) ??
+                          makeProviderFailure({
+                            cause: Cause.squash(cause),
+                            class: "provider_error",
+                          }),
+                      ).pipe(
+                        Effect.andThen(
+                          Effect.logWarning("orchestration-v2.acp-prompt-failed", {
+                            driver,
+                            providerSessionId: input.providerSessionId,
+                            providerThreadId: turnInput.providerThread.id,
+                            providerTurnId,
+                            cause,
+                          }),
+                        ),
                       );
-                      return;
-                    }
-                    yield* finalizeTurn(context, status);
-                  }),
-                ).pipe(Effect.asVoid),
-              ),
-              // Prompt failure is not wire-settled: only a successful resolve marks
-              // the signal. catchCause must not complete promptWireSettled.
-              Effect.catchCause((cause) =>
-                runRuntimeCallbackAtGeneration(
-                  promptGeneration,
-                  Effect.gen(function* () {
-                    if (context.finalized) return;
-                    yield* finalizeTurn(
-                      context,
-                      context.interrupted ? "interrupted" : "failed",
-                      flavor.promptFailure?.(Cause.squash(cause)) ??
-                        makeProviderFailure({
-                          cause: Cause.squash(cause),
-                          class: "provider_error",
-                        }),
-                    ).pipe(
-                      Effect.andThen(
-                        Effect.logWarning("orchestration-v2.acp-prompt-failed", {
-                          driver,
-                          providerSessionId: input.providerSessionId,
-                          providerThreadId: turnInput.providerThread.id,
-                          providerTurnId,
-                          cause,
-                        }),
-                      ),
-                    );
-                  }),
-                ).pipe(Effect.asVoid),
-              ),
-              Effect.forkIn(sessionScope),
-            );
+                    }),
+                  ).pipe(Effect.asVoid),
+                ),
+                Effect.forkIn(sessionScope),
+              );
           },
           (effect, turnInput) =>
             effect.pipe(
@@ -7353,7 +7469,7 @@ export function makeAcpAdapterV2(
                   detail: "ACP runtime did not produce a session id",
                 });
               }
-              const providerThread = makeProviderThread({
+              const createdProviderThread = makeProviderThread({
                 driver,
                 providerInstanceId: options.instanceId,
                 idAllocator,
@@ -7363,6 +7479,18 @@ export function makeAcpAdapterV2(
                 ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
                 now,
               });
+              const providerThread = {
+                ...createdProviderThread,
+                nativeMetadata: {
+                  ...createdProviderThread.nativeMetadata,
+                  ...(nativeHistorySupported
+                    ? flavor.nativeHistory?.initialThreadMetadata(
+                        input.runtimePolicy.cwd ?? process.cwd(),
+                        input.initialNativeThreadId === undefined,
+                      )
+                    : {}),
+                },
+              };
               yield* Ref.update(providerThreadByNativeSessionId, (current) =>
                 new Map(current).set(sessionId, providerThread),
               );
@@ -7885,6 +8013,73 @@ export function makeAcpAdapterV2(
                       detail: `Cannot roll back ACP provider thread ${rollbackInput.providerThread.id} while turn ${currentTurn.providerTurnId} is active`,
                     });
                   }
+                  if (flavor.nativeHistory !== undefined) {
+                    if (
+                      !nativeHistorySupported ||
+                      !(yield* flavor.nativeHistory.isSupported(runtime))
+                    ) {
+                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                        driver,
+                        detail:
+                          "This provider version does not support native conversation rewind.",
+                      });
+                    }
+                    if (yield* sessionRuntime.hasPendingBackgroundWork ?? Effect.succeed(false)) {
+                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                        driver,
+                        detail: "Wait for provider background work to finish before rewinding.",
+                      });
+                    }
+                    yield* awaitRuntimeTeardown();
+                    const sessionId = yield* nativeThreadId(driver, rollbackInput.providerThread);
+                    const restarted = yield* restartRuntimeAfterTeardownIfRequired(
+                      rollbackInput.providerThread.appThreadId,
+                    );
+                    if ((yield* Ref.get(activeSessionId)) !== sessionId || restarted) {
+                      const activated = yield* activateSession(
+                        sessionId,
+                        rollbackInput.providerThread.appThreadId,
+                      );
+                      yield* Ref.set(activeSessionId, activated.sessionId);
+                      yield* Ref.set(activeSessionSetup, activated);
+                    }
+                    const retained = yield* flavor.nativeHistory.rollback({
+                      runtime,
+                      input: rollbackInput,
+                    });
+                    yield* quarantineStoppedRun();
+                    yield* Ref.set(
+                      providerTurns,
+                      new Map(retained.map((turn) => [String(turn.id), turn])),
+                    );
+                    yield* Ref.set(snapshot, {
+                      order: [],
+                      messages: new Map(),
+                      loadingRole: null,
+                      loadingMessageId: null,
+                      loadingIndex: 0,
+                    });
+                    yield* Ref.set(contextUsageBySessionId, new Map());
+                    const now = yield* DateTime.now;
+                    const providerThread = {
+                      ...rollbackInput.providerThread,
+                      providerSessionId: input.providerSessionId,
+                      nativeConversationHeadRef: null,
+                      contextUsage: null,
+                      lastRunOrdinal: rollbackInput.target.appRunOrdinal,
+                      status: "idle" as const,
+                      updatedAt: now,
+                    };
+                    yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                      new Map(current).set(sessionId, providerThread),
+                    );
+                    return {
+                      providerThread,
+                      providerTurns: retained,
+                      messages: [],
+                      runtimeRequests: [],
+                    };
+                  }
                   // ACP defines no conversation truncation, so rollback stages
                   // a fresh native session before retiring the original.
                   // Returning its binding keeps the next turn runnable without
@@ -7970,6 +8165,21 @@ export function makeAcpAdapterV2(
             function* (forkInput) {
               return yield* runtimeTransitionPermit.withPermit(
                 Effect.gen(function* () {
+                  if (
+                    flavor.nativeHistory !== undefined &&
+                    ((yield* Ref.get(activeTurn)) !== null ||
+                      forkInput.sourceProviderTurns?.some(
+                        (turn) =>
+                          turn.providerThreadId === forkInput.sourceProviderThread.id &&
+                          (turn.status === "pending" || turn.status === "running"),
+                      ) ||
+                      (yield* sessionRuntime.hasPendingBackgroundWork ?? Effect.succeed(false)))
+                  ) {
+                    return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver,
+                      detail: "Wait for provider work to finish before forking.",
+                    });
+                  }
                   yield* awaitRuntimeTeardown();
                   useProviderThreadIdentity(forkInput.sourceProviderThread);
                   yield* restartRuntimeAfterTeardownIfRequired(
@@ -7981,7 +8191,10 @@ export function makeAcpAdapterV2(
                       detail: "ACP driver did not negotiate session/fork",
                     });
                   }
-                  if (forkInput.providerTurnId !== undefined) {
+                  if (
+                    forkInput.providerTurnId !== undefined &&
+                    flavor.nativeHistory === undefined
+                  ) {
                     return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                       driver,
                       detail: "ACP session/fork can only fork the current session head",
@@ -7992,10 +8205,42 @@ export function makeAcpAdapterV2(
                     forkInput.sourceProviderThread,
                   );
                   prepareTerminalEnvironment(forkInput.targetThreadId);
-                  const forked = yield* runtime.forkSession(
-                    sourceSessionId,
-                    acpMcpActivation(forkInput.targetThreadId, self),
-                  );
+                  const nativeFork =
+                    flavor.nativeHistory === undefined
+                      ? undefined
+                      : yield* Effect.gen(function* () {
+                          yield* flavor.nativeHistory!.validateForkSource(
+                            forkInput.sourceProviderThread,
+                            input.runtimePolicy.cwd ?? process.cwd(),
+                          );
+                          if (!(yield* flavor.nativeHistory!.isSupported(runtime))) {
+                            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                              driver,
+                              detail:
+                                "This provider version does not support native conversation forks.",
+                            });
+                          }
+                          return yield* flavor.nativeHistory!.fork({
+                            runtime,
+                            input: forkInput,
+                            cwd: input.runtimePolicy.cwd ?? process.cwd(),
+                          });
+                        });
+                  const forked =
+                    nativeFork === undefined
+                      ? yield* runtime.forkSession(
+                          sourceSessionId,
+                          acpMcpActivation(forkInput.targetThreadId, self),
+                        )
+                      : yield* activateSession(nativeFork.sessionId, forkInput.targetThreadId);
+                  const forkMetadata =
+                    nativeFork === undefined
+                      ? undefined
+                      : yield* flavor.nativeHistory!.finalizeForkMetadata(
+                          runtime,
+                          forked.sessionId,
+                          nativeFork.nativeMetadata,
+                        );
                   rememberTerminalEnvironment(forked.sessionId, forkInput.targetThreadId);
                   yield* Ref.set(activeSessionId, forked.sessionId);
                   yield* Ref.set(activeSessionSetup, forked);
@@ -8003,7 +8248,7 @@ export function makeAcpAdapterV2(
                   yield* Ref.set(activeInteractionMode, null);
                   itemIdentityVersion = 2;
                   const now = yield* DateTime.now;
-                  const providerThread = makeProviderThread({
+                  const createdProviderThread = makeProviderThread({
                     driver,
                     providerInstanceId: options.instanceId,
                     idAllocator,
@@ -8022,6 +8267,13 @@ export function makeAcpAdapterV2(
                     },
                     now,
                   });
+                  const providerThread = {
+                    ...createdProviderThread,
+                    nativeMetadata: {
+                      ...createdProviderThread.nativeMetadata,
+                      ...forkMetadata,
+                    },
+                  };
                   yield* Ref.update(providerThreadByNativeSessionId, (current) =>
                     new Map(current).set(forked.sessionId, providerThread),
                   );

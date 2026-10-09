@@ -224,7 +224,28 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
-        orchestrationAdapter,
+        orchestrationAdapter: {
+          ...orchestrationAdapter,
+          getCapabilities: () =>
+            Effect.gen(function* () {
+              const capabilities = yield* orchestrationAdapter.getCapabilities();
+              const providerSnapshot = yield* snapshot.getSnapshot;
+              const supported = Boolean(providerSnapshot.supportsConversationRollback);
+              return {
+                ...capabilities,
+                threads: {
+                  ...capabilities.threads,
+                  canRollbackThread: supported,
+                  canForkThread: supported,
+                  canForkFromTurn: supported,
+                },
+                checkpointing: {
+                  ...capabilities.checkpointing,
+                  providerCanRollbackConversation: supported,
+                },
+              };
+            }),
+        },
         textGeneration,
       } satisfies ProviderInstance;
     }),
