@@ -7,6 +7,21 @@ import * as PlatformError from "effect/PlatformError";
 
 import { resolveUserDataPath } from "./DesktopUserData.ts";
 
+it.effect("an explicit personal profile never inspects or migrates the installed profile", () =>
+  Effect.gen(function* () {
+    const selected = yield* resolveUserDataPath({
+      appDataDirectory: "/installed/profiles",
+      isDevelopment: false,
+      platform: "win32",
+      userDataPathOverride: "/personal/electron-profile",
+    });
+    assert.equal(selected, "/personal/electron-profile");
+  }).pipe(
+    Effect.provideService(FileSystem.FileSystem, FileSystem.makeNoop({})),
+    Effect.provide(NodeServices.layer),
+  ),
+);
+
 it.effect("identifies a failed source read and preserves its cause", () => {
   const sourceState = "/profiles/t3code/Local State";
   const cause = PlatformError.systemError({
