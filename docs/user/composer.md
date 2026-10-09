@@ -140,6 +140,8 @@ resending. Any unsent draft stays above the restored prompt.
 This removes the selected message and later conversation from the active thread
 and provider history. It does not undo external actions or separate provider
 memory. The action is available only when the provider supports rewind.
+Conversation-only edits also work outside Git repositories and when a file
+checkpoint is unavailable. Restoring files requires a ready checkpoint.
 
 ## Prompt stash
 

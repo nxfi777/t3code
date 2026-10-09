@@ -895,7 +895,11 @@ export const revertThreadCheckpoint = Effect.fn("EnvironmentCommands.revertThrea
           ? candidate.ordinalWithinScope === 0 && candidate.appRunOrdinal === null
           : candidate.appRunOrdinal === input.turnCount,
       );
-    if (checkpoint === undefined || checkpoint.status !== "ready") {
+    if (
+      checkpoint === undefined ||
+      checkpoint.status === "stale" ||
+      (input.restoreFiles !== false && checkpoint.status !== "ready")
+    ) {
       const target =
         input.checkpointId === undefined
           ? `run ordinal ${input.turnCount ?? "unknown"}`
