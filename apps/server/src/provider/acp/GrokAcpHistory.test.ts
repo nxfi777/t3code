@@ -103,7 +103,7 @@ function runtime(
       }
       return (
         input.rewindResult ?? {
-          success: true,
+          success: (payload as { force?: boolean }).force === true,
           target_prompt_index: (payload as { targetPromptIndex: number }).targetPromptIndex,
           mode: "conversation_only",
         }
@@ -285,7 +285,7 @@ describe("Grok prompt boundaries", () => {
           sessionId: "native-source",
           targetPromptIndex: 5,
           mode: "conversation_only",
-          force: false,
+          force: true,
         },
       });
     }),
@@ -306,7 +306,7 @@ describe("Grok prompt boundaries", () => {
         sessionId: "native-source",
         targetPromptIndex: 7,
         mode: "conversation_only",
-        force: false,
+        force: true,
       });
     }),
   );
