@@ -880,14 +880,15 @@ const program = Effect.gen(function* () {
       if (grokNativeHistory) {
         const promptIndex = grokPromptCounts.get(requestedSessionId) ?? grokInitialPromptCount;
         grokPromptCounts.set(requestedSessionId, promptIndex + 1);
-        yield* agent.client.sessionUpdate({
-          sessionId: requestedSessionId,
-          update: {
-            sessionUpdate: "user_message_chunk",
-            content: request.prompt[0] ?? { type: "text", text: "native user prompt" },
-            _meta: { promptIndex },
-          },
-        });
+        if (process.env.T3_ACP_GROK_NO_USER_ECHO !== "1")
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              content: request.prompt[0] ?? { type: "text", text: "native user prompt" },
+              _meta: { promptIndex },
+            },
+          });
         yield* agent.client.sessionUpdate({
           sessionId: requestedSessionId,
           update: {

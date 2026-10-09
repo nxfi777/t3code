@@ -17,7 +17,12 @@ const driver = ProviderDriverKind.make("grok");
 const PromptIndex = NonNegativeInt.check(Schema.isLessThan(Number.MAX_SAFE_INTEGER));
 const Boundary = Schema.Struct({ sessionId: Schema.String, first: PromptIndex, last: PromptIndex });
 const decodeBoundary = Schema.decodeUnknownOption(Schema.fromJsonString(Boundary));
+const encodeBoundary = Schema.encodeEffect(Schema.fromJsonString(Boundary));
 const referencePrefix = "grok-prompt-v1:";
+const pendingReferencePrefix = "grok-pending-prompt-v1:";
+const PendingBoundary = Schema.Struct({ sessionId: Schema.String, promptCount: PromptIndex });
+const decodePendingBoundary = Schema.decodeUnknownOption(Schema.fromJsonString(PendingBoundary));
+const encodePendingBoundary = Schema.encodeEffect(Schema.fromJsonString(PendingBoundary));
 const unmappedReference = "grok-history-unmapped";
 const correlationKey = "t3.historyRequestId";
 const RewindPoints = Schema.Struct({
@@ -193,8 +198,50 @@ export const grokNativeHistory: AcpAdapterV2NativeHistory = {
     grokHistoryCwd: cwd,
     ...(isNew ? { grokHistoryStartPromptIndex: 0 } : {}),
   }),
+  beginTurnReference: (runtime, sessionId) =>
+    Effect.gen(function* () {
+      const promptCount = yield* readPoints(runtime, sessionId);
+      return {
+        driver,
+        nativeId:
+          pendingReferencePrefix + (yield* encodePendingBoundary({ sessionId, promptCount })),
+        strength: "weak" as const,
+      };
+    }).pipe(
+      Effect.timeout("2 seconds"),
+      Effect.orElseSucceed(() => ({
+        driver,
+        nativeId: unmappedReference,
+        strength: "weak" as const,
+      })),
+    ),
   finalizeTurnReference: (runtime, current) =>
     Effect.gen(function* () {
+      const pending = current?.nativeId?.startsWith(pendingReferencePrefix)
+        ? Option.getOrUndefined(
+            decodePendingBoundary(current.nativeId.slice(pendingReferencePrefix.length)),
+          )
+        : undefined;
+      if (pending !== undefined) {
+        const count = yield* readPoints(runtime, pending.sessionId);
+        // Stable Grok releases can omit live user echoes. The prompt is serialized
+        // by the runtime, and this is called only after its successful completion.
+        // Exactly one native increment proves the accepted prompt's own index.
+        // Additional synthetic/background prompts make this fallback ambiguous.
+        return count === pending.promptCount + 1
+          ? {
+              driver,
+              nativeId:
+                referencePrefix +
+                (yield* encodeBoundary({
+                  sessionId: pending.sessionId,
+                  first: pending.promptCount,
+                  last: pending.promptCount,
+                })),
+              strength: "strong" as const,
+            }
+          : { driver, nativeId: unmappedReference, strength: "weak" as const };
+      }
       const boundary = current?.nativeId?.startsWith(referencePrefix)
         ? Option.getOrUndefined(decodeBoundary(current.nativeId.slice(referencePrefix.length)))
         : undefined;

@@ -619,6 +619,7 @@ describe("AcpAdapterV2", () => {
         protocolEvents,
         environment: (runtimeOrdinal) => ({
           T3_ACP_GROK_NATIVE_HISTORY: supported ? "1" : "0",
+          T3_ACP_GROK_NO_USER_ECHO: "1",
           T3_ACP_GROK_INITIAL_PROMPT_COUNT: runtimeOrdinal === 1 ? "5" : "7",
         }),
       });
@@ -695,7 +696,7 @@ describe("AcpAdapterV2", () => {
           if (
             event.type === "provider_turn.updated" &&
             event.providerTurn.status === "running" &&
-            event.providerTurn.nativeTurnRef?.nativeId?.startsWith("grok-prompt-v1:")
+            event.providerTurn.nativeTurnRef?.nativeId?.startsWith("grok-pending-prompt-v1:")
           ) {
             durableEchoes.push(event.providerTurn);
           }

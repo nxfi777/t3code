@@ -42,8 +42,12 @@ native invalid-parameters response before advertising support; no session is cre
 probe. Rewind uses `conversation_only`, leaving filesystem restoration to T3's checkpoint flow.
 
 T3 records Grok's actual prompt indices from correlated content-block echoes and persists them
-as provider-turn references. A completed boundary is usable only after the native head confirms
-it. App turn ordinals are never used as Grok prompt indices. Older conversations, interrupted
+as provider-turn references. Stable CLI versions can omit those echoes; for a serialized prompt
+without pre-existing background work, T3 reads the native head before dispatch and requires
+exactly one new native prompt on successful completion. Extra synthetic prompts make that
+fallback ambiguous and disable history operations at that response. A completed boundary is
+usable only after the native head confirms it. App turn ordinals are never used as Grok prompt
+indices. Older conversations, interrupted
 turns without a confirmed boundary, and unmapped synthetic continuation turns cannot be rewound
 or forked at those points. The adapter reports an error instead of guessing or losing context.
 Newly recorded completed turns in existing conversations can acquire verified boundaries.
