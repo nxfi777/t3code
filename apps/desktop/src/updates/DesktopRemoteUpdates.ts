@@ -82,7 +82,9 @@ export const listen: Effect.Effect<
               : {}),
           ...(terminal === undefined ? {} : { outcome: terminal.outcome }),
           ...(reason ? { reason } : {}),
-          state,
+          // Older remote clients do not know notifyOnly; never advertise an
+          // installable desktop update through their existing enabled flag.
+          state: state.notifyOnly ? { ...state, enabled: false, status: "disabled" } : state,
         }),
       ),
     );

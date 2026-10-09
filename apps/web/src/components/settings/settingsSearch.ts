@@ -585,6 +585,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["OTel OTLP telemetry export endpoints logs traces metrics Grafana"],
   },
   {
+    id: "app-updates",
+    title: "App updates",
+    to: "/settings/general",
+    targetId: "about",
+    searchTerms: [
+      "version check upstream releases release notes notify notification notifications manual custom build stable latest",
+    ],
+    desktopOnly: true,
+  },
+  {
     id: "diagnostics",
     title: "Diagnostics",
     to: "/settings/general",

@@ -838,4 +838,24 @@ describe("DesktopRemoteUpdates", () => {
       }),
     );
   });
+
+  it.effect("reports notification-only builds as non-installable to older remote clients", () => {
+    const harness = makeHarness({
+      env: { T3CODE_UPDATE_NOTIFY_ONLY_VERSION: "0.0.45" },
+      isPackaged: false,
+    });
+    return runRemoteUpdatesTest(harness, ({ reports, requests }) =>
+      Effect.gen(function* () {
+        yield* Queue.offer(requests, request("notify-only"));
+        yield* settle;
+        const terminals = terminalReports(reports);
+        assert.equal(terminals.length, 1);
+        assert.equal(terminals[0]?.outcome, "failed");
+        assert.include(terminals[0]?.reason, "only checks for releases");
+        assert.isTrue(reports.every((report) => !report.state.enabled));
+        assert.equal(harness.downloadCount(), 0);
+        assert.equal(harness.quitAndInstalls(), 0);
+      }),
+    );
+  });
 });

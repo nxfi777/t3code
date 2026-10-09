@@ -34,6 +34,7 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as IpcChannels from "../ipc/channels.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import { normalizeDesktopUpdateReleaseNotes } from "./releaseNotes.ts";
+import { checkReleaseNotification, stableVersion } from "./releaseNotifications.ts";
 import { resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
 import {
   createInitialDesktopUpdateState,
@@ -350,6 +351,23 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
+  const notifyOnly = Option.isSome(config.updateNotifyOnlyVersion);
+  const notificationVersion = Option.getOrElse(
+    config.updateNotifyOnlyVersion,
+    () => environment.appVersion,
+  );
+  const configuredBaseUpdateState = (
+    channel: DesktopUpdateChannel,
+    enabled: boolean,
+  ): DesktopUpdateState => ({
+    ...createBaseUpdateState(notifyOnly ? "latest" : channel, enabled, environment),
+    ...(notifyOnly
+      ? {
+          notifyOnly: true,
+          currentVersion: stableVersion(notificationVersion) ?? notificationVersion,
+        }
+      : {}),
+  });
 
   const appUpdateYmlConfigRef = yield* Ref.make<Option.Option<AppUpdateYmlConfig>>(Option.none());
   const activeUpdateActionRef = yield* Ref.make<Option.Option<UpdateAction>>(Option.none());
@@ -358,11 +376,7 @@ export const make = Effect.gen(function* () {
   const lastLoggedDownloadMilestoneRef = yield* Ref.make(-1);
   const notAppliedVersionRef = yield* Ref.make(Option.none<string>());
   const updateStateRef = yield* Ref.make<DesktopUpdateState>(
-    createInitialDesktopUpdateState(
-      environment.appVersion,
-      environment.runtimeInfo,
-      environment.defaultDesktopSettings.updateChannel,
-    ),
+    configuredBaseUpdateState(environment.defaultDesktopSettings.updateChannel, false),
   );
 
   const stateChanges = yield* PubSub.sliding<DesktopUpdateState>(16);
@@ -418,6 +432,15 @@ export const make = Effect.gen(function* () {
   );
 
   const resolveDisabledReason = Effect.gen(function* () {
+    if (notifyOnly) {
+      return config.disableAutoUpdate
+        ? Option.some("Update checks are disabled by T3CODE_DISABLE_AUTO_UPDATE.")
+        : stableVersion(notificationVersion)
+          ? Option.none<string>()
+          : Option.some(
+              "Update notifications require a stable source version (for example, 0.0.45).",
+            );
+    }
     const hasFeedConfig = yield* hasUpdateFeedConfig;
     return Option.fromNullishOr(
       getAutoUpdateDisabledReason({
@@ -498,6 +521,22 @@ export const make = Effect.gen(function* () {
       yield* setState(reduceDesktopUpdateStateOnCheckStart(state, checkedAt));
       yield* logUpdaterInfo("checking for updates", { reason });
 
+      if (notifyOnly) {
+        yield* checkReleaseNotification(notificationVersion).pipe(
+          Effect.flatMap((version) =>
+            setState(
+              version
+                ? reduceDesktopUpdateStateOnUpdateAvailable(state, version, checkedAt, [], 0)
+                : reduceDesktopUpdateStateOnNoUpdate(state, checkedAt),
+            ),
+          ),
+          Effect.catch((error) =>
+            setState(reduceDesktopUpdateStateOnCheckFailure(state, error.message, checkedAt)),
+          ),
+        );
+        return true;
+      }
+
       return yield* electronUpdater.checkForUpdates.pipe(
         Effect.as(true),
         Effect.catchTags({
@@ -529,7 +568,7 @@ export const make = Effect.gen(function* () {
 
   const downloadAvailableUpdate = Effect.gen(function* () {
     const state = yield* Ref.get(updateStateRef);
-    if (!(yield* Ref.get(updaterConfiguredRef)) || state.status !== "available") {
+    if (notifyOnly || !(yield* Ref.get(updaterConfiguredRef)) || state.status !== "available") {
       return { accepted: false, completed: false };
     }
 
@@ -647,7 +686,7 @@ export const make = Effect.gen(function* () {
   const baseUpdateState = (channel: DesktopUpdateChannel, enabled: boolean) =>
     Ref.get(notAppliedVersionRef).pipe(
       Effect.map((notAppliedVersion) => ({
-        ...createBaseUpdateState(channel, enabled, environment),
+        ...configuredBaseUpdateState(channel, enabled),
         ...Option.match(notAppliedVersion, {
           onNone: () => ({}),
           onSome: (version) => ({ notAppliedVersion: version }),
@@ -807,7 +846,7 @@ export const make = Effect.gen(function* () {
   const installWithExpectedVersion = Effect.fn("desktop.updates.install")(function* (
     expectedVersion?: string,
   ) {
-    if (yield* Ref.get(desktopState.quitting)) {
+    if (notifyOnly || (yield* Ref.get(desktopState.quitting))) {
       return {
         accepted: false,
         completed: false,
@@ -840,7 +879,7 @@ export const make = Effect.gen(function* () {
       }),
       Effect.forkScoped,
     );
-    yield* Effect.sleep(AUTO_UPDATE_POLL_INTERVAL).pipe(
+    yield* Effect.sleep(notifyOnly ? "6 hours" : AUTO_UPDATE_POLL_INTERVAL).pipe(
       Effect.andThen(checkForUpdates("poll")),
       Effect.forever,
       Effect.catchCause((cause) => {
@@ -1041,6 +1080,21 @@ export const make = Effect.gen(function* () {
         void Effect.runPromiseWith(context)(effect);
       };
 
+      // Safe even when checks are disabled or this is an unpackaged source build.
+      yield* electronUpdater.setAutoDownload(false);
+      yield* electronUpdater.setAutoInstallOnAppQuit(false);
+
+      const settings = yield* desktopSettings.get;
+      if (notifyOnly) {
+        const enabled = yield* shouldEnableAutoUpdates;
+        yield* setState(yield* baseUpdateState(settings.updateChannel, enabled));
+        if (enabled) {
+          yield* Ref.set(updaterConfiguredRef, true);
+          yield* startUpdatePollers;
+        }
+        return;
+      }
+
       const appUpdateYmlConfig = yield* readAppUpdateYml;
       yield* Ref.set(appUpdateYmlConfigRef, appUpdateYmlConfig);
 
@@ -1060,7 +1114,6 @@ export const make = Effect.gen(function* () {
         } as ElectronUpdater.ElectronUpdaterFeedUrl);
       }
 
-      const settings = yield* desktopSettings.get;
       const enabled = yield* shouldEnableAutoUpdates;
       yield* setState(yield* baseUpdateState(settings.updateChannel, enabled));
       if (!enabled) {
@@ -1068,8 +1121,6 @@ export const make = Effect.gen(function* () {
       }
       yield* Ref.set(updaterConfiguredRef, true);
 
-      yield* electronUpdater.setAutoDownload(false);
-      yield* electronUpdater.setAutoInstallOnAppQuit(false);
       yield* applyAutoUpdaterChannel(settings.updateChannel);
       yield* electronUpdater.setDisableDifferentialDownload(
         isArm64HostRunningIntelBuild(environment.runtimeInfo),
@@ -1110,6 +1161,7 @@ export const make = Effect.gen(function* () {
       nextChannel: DesktopUpdateChannel,
     ) {
       yield* Effect.annotateCurrentSpan({ channel: nextChannel });
+      if (notifyOnly) return yield* Ref.get(updateStateRef);
       const activeAction = yield* tryStartChannelChange;
       if (Option.isSome(activeAction)) {
         return yield* new DesktopUpdateActionInProgressError({

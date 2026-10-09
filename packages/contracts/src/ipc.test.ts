@@ -1,7 +1,32 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+import { DesktopEnvironmentBootstrapSchema, DesktopUpdateStateSchema } from "./ipc.ts";
+
+const decodeUpdateState = Schema.decodeUnknownSync(DesktopUpdateStateSchema);
+
+it("accepts legacy desktop update state and preserves optional notify-only mode", () => {
+  const state = {
+    enabled: true,
+    status: "available",
+    channel: "latest",
+    currentVersion: "0.0.45",
+    hostArch: "arm64",
+    appArch: "arm64",
+    runningUnderArm64Translation: false,
+    availableVersion: "0.0.46",
+    downloadedVersion: null,
+    releaseNotes: [],
+    omittedReleaseCount: 0,
+    downloadPercent: null,
+    checkedAt: null,
+    message: null,
+    errorContext: null,
+    canRetry: false,
+  };
+  expect(decodeUpdateState(state)).toEqual(state);
+  expect(decodeUpdateState({ ...state, notifyOnly: true })).toEqual({ ...state, notifyOnly: true });
+});
 
 describe("DesktopEnvironmentBootstrapSchema", () => {
   const decode = Schema.decodeUnknownSync(DesktopEnvironmentBootstrapSchema);

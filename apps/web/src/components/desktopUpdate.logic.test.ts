@@ -35,6 +35,50 @@ const baseState: DesktopUpdateState = {
 };
 
 describe("desktop update button state", () => {
+  it.each(["available", "downloaded", "error"] as const)(
+    "offers only release notes for notify-only mode with %s state",
+    (status) => {
+      const state: DesktopUpdateState = {
+        ...baseState,
+        notifyOnly: true,
+        status,
+        availableVersion: "1.1.0",
+        downloadedVersion: "1.1.0",
+        errorContext: "install",
+      };
+      expect(resolveDesktopUpdateButtonAction(state)).toBe("release-notes");
+      expect(getDesktopUpdateButtonTooltip(state)).toContain("update this custom build manually");
+      expect(getDesktopUpdateReleaseUrl(state.availableVersion)).toBe(
+        "https://github.com/pingdotgg/t3code/releases/tag/v1.1.0",
+      );
+    },
+  );
+
+  it("keeps notify-only checks available and disables repeated checks while pending", () => {
+    const state: DesktopUpdateState = { ...baseState, notifyOnly: true, currentVersion: "0.0.45" };
+    expect(canCheckForUpdate(state)).toBe(true);
+    expect(resolveDesktopUpdateButtonAction(state)).toBe("none");
+    expect(getDesktopUpdateButtonTooltip(state)).toContain("based on T3 Code 0.0.45");
+    const checking: DesktopUpdateState = {
+      ...state,
+      status: "checking",
+      availableVersion: "0.0.46",
+    };
+    expect(canCheckForUpdate(checking)).toBe(false);
+    expect(isDesktopUpdateButtonDisabled(checking)).toBe(true);
+    expect(resolveDesktopUpdateButtonAction(checking)).toBe("none");
+  });
+
+  it("does not turn a stale downloaded version into an install path in notify-only mode", () => {
+    const state: DesktopUpdateState = {
+      ...baseState,
+      notifyOnly: true,
+      status: "downloaded",
+      downloadedVersion: "1.1.0",
+    };
+    expect(resolveDesktopUpdateButtonAction(state)).toBe("none");
+  });
+
   it("shows a download action when an update is available", () => {
     const state: DesktopUpdateState = {
       ...baseState,

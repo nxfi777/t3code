@@ -58,6 +58,18 @@ describe("searchSettings", () => {
       );
     },
   );
+  it.each(["Upstream releases", "notify", "release notifications"])(
+    "finds app updates in About for %s",
+    (query) => {
+      const updates = SETTINGS_SEARCH_ITEMS.find((item) => item.id === "app-updates")!;
+      expect(updates.desktopOnly).toBe(true);
+      // This suite runs in browser mode; exercise the desktop catalog's search terms.
+      expect(searchSettings(query, [{ ...updates, desktopOnly: false }])).toContainEqual(
+        expect.objectContaining({ id: "app-updates", to: "/settings/general", targetId: "about" }),
+      );
+    },
+  );
+
   it.each(["send shortcut", "multiline", "new line"])("finds Send shortcut for %s", (query) => {
     expect(searchSettings(query).map((item) => item.id)).toContain("send-shortcut");
   });

@@ -31,6 +31,9 @@ describe("sidebar update release notes popover", () => {
     expect(shouldUseSidebarUpdateReleaseNotesPopover(true, nightlyState)).toBe(true);
     expect(shouldUseSidebarUpdateReleaseNotesPopover(false, nightlyState)).toBe(false);
     expect(
+      shouldUseSidebarUpdateReleaseNotesPopover(true, { ...nightlyState, notifyOnly: true }),
+    ).toBe(false);
+    expect(
       shouldUseSidebarUpdateReleaseNotesPopover(true, {
         ...nightlyState,
         channel: "latest",

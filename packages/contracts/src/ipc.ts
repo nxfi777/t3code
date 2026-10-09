@@ -269,6 +269,8 @@ export interface DesktopRuntimeInfo {
 
 export interface DesktopUpdateState {
   enabled: boolean;
+  /** Source builds can report upstream releases without downloading or installing them. */
+  notifyOnly?: boolean;
   status: DesktopUpdateStatus;
   channel: DesktopUpdateChannel;
   currentVersion: string;
@@ -306,6 +308,7 @@ export const DesktopUpdateReleaseNoteSchema = Schema.Struct({
 
 export const DesktopUpdateStateSchema = Schema.Struct({
   enabled: Schema.Boolean,
+  notifyOnly: Schema.optionalKey(Schema.Boolean),
   status: DesktopUpdateStatusSchema,
   channel: DesktopUpdateChannelSchema,
   currentVersion: Schema.String,
