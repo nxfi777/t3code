@@ -284,7 +284,9 @@ export const grokNativeHistory: AcpAdapterV2NativeHistory = {
         sessionId,
         targetPromptIndex: retainCount,
         mode: "conversation_only",
-        force: false,
+        // In Grok this selects commit mode; false is a read-only preview.
+        // conversation_only keeps filesystem restoration under T3's control.
+        force: true,
       });
       const result = Option.getOrUndefined(decodeRewindResult(payload));
       if (result?.success !== true || result.target_prompt_index !== retainCount) {

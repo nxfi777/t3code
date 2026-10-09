@@ -814,7 +814,7 @@ describe("AcpAdapterV2", () => {
             sessionId: providerThread.nativeThreadRef?.nativeId,
             targetPromptIndex: 6,
             mode: "conversation_only",
-            force: false,
+            force: true,
           },
         ],
       );

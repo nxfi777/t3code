@@ -2384,9 +2384,18 @@ const program = Effect.gen(function* () {
         grokPromptCounts.set(newSessionId, target + 1);
         return Effect.succeed({ newSessionId, parentSessionId: sourceSessionId });
       }
-      grokPromptCounts.set(sourceSessionId, target);
+      if (value.mode !== "conversation_only") {
+        return Effect.fail(
+          new AcpError.AcpRequestError({
+            code: -32602,
+            errorMessage: "Expected conversation-only rewind",
+          }),
+        );
+      }
+      // Native Grok previews without mutation unless force selects commit mode.
+      if (value.force === true) grokPromptCounts.set(sourceSessionId, target);
       return Effect.succeed({
-        success: true,
+        success: value.force === true,
         target_prompt_index: target,
         mode: "conversation_only",
       });
