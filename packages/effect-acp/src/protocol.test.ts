@@ -371,58 +371,67 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
-  it.effect("correlates extension response errors with the originating request", () =>
-    Effect.gen(function* () {
-      const { stdio, input, output } = yield* makeInMemoryStdio();
-      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
-        stdio,
-        serverRequestMethods: new Set(),
-      });
+  it.effect.each(["json-rpc", "effect-cause"] as const)(
+    "correlates %s extension errors with the originating request",
+    (format) =>
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+          stdio,
+          serverRequestMethods: new Set(),
+        });
 
-      const response = yield* transport
-        .request("x/private", { hello: "world" })
-        .pipe(Effect.forkScoped);
-      yield* Queue.take(output);
-      yield* Queue.offer(
-        input,
-        encoder.encode(
-          `${encodeUnknownJsonString({
-            jsonrpc: "2.0",
-            id: 1,
-            error: {
-              _tag: "Cause",
-              code: -32602,
-              message: "Invalid params",
-              data: [
-                {
-                  _tag: "Fail",
-                  error: {
-                    code: -32602,
-                    message: "Invalid params",
-                    data: { field: "hello" },
-                  },
-                },
-              ],
-            },
-          })}\n`,
-        ),
-      );
+        const response = yield* transport
+          .request("x/private", { hello: "world" })
+          .pipe(Effect.forkScoped);
+        yield* Queue.take(output);
+        yield* Queue.offer(
+          input,
+          encoder.encode(
+            `${encodeUnknownJsonString({
+              jsonrpc: "2.0",
+              id: 1,
+              error:
+                format === "json-rpc"
+                  ? {
+                      code: -32602,
+                      message: "Invalid params",
+                      data: "missing field `session_id`",
+                    }
+                  : {
+                      _tag: "Cause",
+                      code: -32602,
+                      message: "Invalid params",
+                      data: [
+                        {
+                          _tag: "Fail",
+                          error: {
+                            code: -32602,
+                            message: "Invalid params",
+                            data: { field: "hello" },
+                          },
+                        },
+                      ],
+                    },
+            })}\n`,
+          ),
+        );
 
-      const error = yield* Fiber.join(response).pipe(
-        Effect.match({
-          onFailure: (error) => error,
-          onSuccess: () => assert.fail("Expected extension request to fail"),
-        }),
-      );
-      assert.instanceOf(error, AcpError.AcpRequestError);
-      assert.deepInclude(error, {
-        code: -32602,
-        errorMessage: "Invalid params",
-        method: "x/private",
-        requestId: 1,
-        operation: "receive-response",
-      });
-    }),
+        const error = yield* Fiber.join(response).pipe(
+          Effect.match({
+            onFailure: (error) => error,
+            onSuccess: () => assert.fail("Expected extension request to fail"),
+          }),
+        );
+        assert.instanceOf(error, AcpError.AcpRequestError);
+        assert.deepInclude(error, {
+          code: -32602,
+          errorMessage: "Invalid params",
+          method: "x/private",
+          requestId: 1,
+          operation: "receive-response",
+        });
+      }),
   );
 
   it.effect("preserves numeric ids for inbound extension requests", () =>
