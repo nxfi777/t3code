@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import * as PreviewManager from "../../preview/Manager.ts";
+import { PreviewDevtoolsError } from "../../preview/Devtools.ts";
 import * as BrowserImport from "../../preview/BrowserImport/BrowserImport.ts";
 import * as PreviewIpc from "./preview.ts";
 
@@ -37,6 +38,26 @@ describe("preview IPC methods", () => {
   beforeEach(() => {
     fromPartition.mockClear();
   });
+
+  effectIt.effect("preserves intentional DevTools diagnostics across Electron IPC", () =>
+    Effect.gen(function* () {
+      const manager = PreviewManager.PreviewManager.of({
+        automationDevtools: () =>
+          Effect.fail(
+            new PreviewDevtoolsError({
+              detail: "Request is unavailable or was evicted. List network requests again.",
+            }),
+          ),
+      } as unknown as PreviewManager.PreviewManager["Service"]);
+      const result = yield* PreviewIpc.automationDevtools
+        .handler({ tabId: "tab", input: { action: "request", requestId: "missing" } })
+        .pipe(Effect.provideService(PreviewManager.PreviewManager, manager));
+      expect(result).toEqual({
+        _tag: "PreviewDevtoolsFailure",
+        detail: "Request is unavailable or was evicted. List network requests again.",
+      });
+    }),
+  );
 
   it("does not access the Electron session while the module loads", async () => {
     await expect(import("./preview.ts")).resolves.toBeDefined();
