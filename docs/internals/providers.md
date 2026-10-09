@@ -36,6 +36,26 @@ Forks use Pi's CLI in the destination directory because RPC session switching re
 session's cwd. Provider switches still use portable handoff summaries.
 See the [adapter](../../packages/provider-pi/src/server/adapter.ts).
 
+Grok's native history integration uses its `x.ai/rewind` and `x.ai/session/fork` ACP
+extensions. Initialization probes each extension with missing parameters and requires the
+native invalid-parameters response before advertising support; no session is created by the
+probe. Rewind uses `conversation_only`, leaving filesystem restoration to T3's checkpoint flow.
+
+T3 records Grok's actual prompt indices from correlated content-block echoes and persists them
+as provider-turn references. A completed boundary is usable only after the native head confirms
+it. App turn ordinals are never used as Grok prompt indices. Older conversations, interrupted
+turns without a confirmed boundary, and unmapped synthetic continuation turns cannot be rewound
+or forked at those points. The adapter reports an error instead of guessing or losing context.
+Newly recorded completed turns in existing conversations can acquire verified boundaries.
+
+Native Grok forks require a recorded source working directory. The native fork operation reads
+the source storage directly; T3 loads only the child and validates its native prompt count.
+It never loads or rewinds the source in the target runtime, so detached source work is left alone.
+Source and target working directories may differ. The child persists its inherited native prompt
+count so editing its first new message preserves
+the source history, including after a server restart. See
+[GrokAcpHistory](../../apps/server/src/provider/acp/GrokAcpHistory.ts).
+
 Antigravity separates account profiles per instance while sharing installed executables across the
 environment. It forces file-based credential storage because the native macOS keychain entry would
 otherwise be shared across instances. The launch environment removes ambient Google credentials,

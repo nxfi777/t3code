@@ -836,6 +836,10 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   /** Version 2 scopes provider-derived item ids by provider instance. */
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  /** Native Grok prompts inherited before this T3 thread's first run. */
+  grokHistoryStartPromptIndex: Schema.optional(NonNegativeInt),
+  /** Native Grok storage namespace; a fork must resolve its source in this cwd. */
+  grokHistoryCwd: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
