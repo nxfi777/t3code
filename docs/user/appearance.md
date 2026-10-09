@@ -21,6 +21,13 @@ Android uses **Material You Layout** by default unless you have turned it off in
 It changes shapes, spacing, and controls independently
 of the selected theme.
 
+## Math
+
+On web and desktop, turn on **Render math** in **Settings → Appearance** to typeset LaTeX in
+messages and Markdown previews. It reads `$…$`, `$$…$$`, `\(…\)`, and `\[…\]`, outside of code.
+Dollar amounts such as `$5 and $10` stay text; write `\$` to keep any other dollar sign literal.
+Copying a formula copies its TeX. The mobile app shows the TeX source.
+
 ## Motion
 
 The main sidebar, right panel, and terminal drawer open and close immediately by default. Move the
