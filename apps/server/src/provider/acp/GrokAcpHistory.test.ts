@@ -104,7 +104,7 @@ function runtime(
       return (
         input.rewindResult ?? {
           success: (payload as { force?: boolean }).force === true,
-          target_prompt_index: (payload as { targetPromptIndex: number }).targetPromptIndex,
+          target_prompt_index: (payload as { target_prompt_index: number }).target_prompt_index,
           mode: "conversation_only",
         }
       );
@@ -282,8 +282,8 @@ describe("Grok prompt boundaries", () => {
       assert.deepEqual(mock.requests[1], {
         method: "_x.ai/rewind/execute",
         payload: {
-          sessionId: "native-source",
-          targetPromptIndex: 5,
+          session_id: "native-source",
+          target_prompt_index: 5,
           mode: "conversation_only",
           force: true,
         },
@@ -303,8 +303,8 @@ describe("Grok prompt boundaries", () => {
         },
       });
       assert.deepEqual(mock.requests[1]?.payload, {
-        sessionId: "native-source",
-        targetPromptIndex: 7,
+        session_id: "native-source",
+        target_prompt_index: 7,
         mode: "conversation_only",
         force: true,
       });

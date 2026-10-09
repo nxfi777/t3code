@@ -2356,7 +2356,7 @@ const program = Effect.gen(function* () {
     ) {
       const value = params as Record<string, unknown>;
       const sourceSessionId =
-        method === "_x.ai/session/fork" ? value.sourceSessionId : value.sessionId;
+        method === "_x.ai/session/fork" ? value.sourceSessionId : value.session_id;
       if (typeof sourceSessionId !== "string") {
         return Effect.fail(
           new AcpError.AcpRequestError({ code: -32602, errorMessage: "Missing session id" }),
@@ -2368,7 +2368,8 @@ const program = Effect.gen(function* () {
           rewind_points: Array.from({ length: count }, (_, prompt_index) => ({ prompt_index })),
         });
       }
-      const target = value.targetPromptIndex;
+      const target =
+        method === "_x.ai/session/fork" ? value.targetPromptIndex : value.target_prompt_index;
       if (
         typeof target !== "number" ||
         !Number.isInteger(target) ||

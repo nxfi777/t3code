@@ -93,7 +93,7 @@ function sessionIdOf(thread: OrchestrationV2ProviderThread) {
 }
 
 const readPoints = Effect.fnUntraced(function* (runtime: Runtime, sessionId: string) {
-  const payload = yield* runtime.request("_x.ai/rewind/points", { sessionId });
+  const payload = yield* runtime.request("_x.ai/rewind/points", { session_id: sessionId });
   const points = yield* decodeRewindPoints(payload).pipe(
     Effect.mapError(
       (cause) =>
@@ -281,8 +281,8 @@ export const grokNativeHistory: AcpAdapterV2NativeHistory = {
     }
     if (retainCount < promptCount) {
       const payload = yield* runtime.request("_x.ai/rewind/execute", {
-        sessionId,
-        targetPromptIndex: retainCount,
+        session_id: sessionId,
+        target_prompt_index: retainCount,
         mode: "conversation_only",
         // In Grok this selects commit mode; false is a read-only preview.
         // conversation_only keeps filesystem restoration under T3's control.
