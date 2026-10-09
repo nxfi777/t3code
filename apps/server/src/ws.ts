@@ -103,6 +103,7 @@ import {
   cleanupFailedUploadedAttachments,
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
+import * as ThreadFork from "./orchestration/ThreadFork.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
@@ -522,6 +523,7 @@ const makeWsRpcLayer = (
               Effect.orElseSucceed(() => null),
             );
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+      const threadFork = yield* ThreadFork.ThreadFork.pipe(Effect.provide(ThreadFork.layer));
       const threadDeletionReactor = yield* ThreadDeletionReactor;
       const analytics = yield* AnalyticsService.AnalyticsService;
       // Every command dispatched on this connection carries the connecting
@@ -2137,6 +2139,19 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [ORCHESTRATION_WS_METHODS.forkThread]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.forkThread,
+            threadFork
+              .fork(input)
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationDispatchCommandError({ message: cause.message, cause }),
+                ),
+              ),
+            { "rpc.aggregate": "orchestration" },
+          ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,

@@ -56,6 +56,7 @@ const makeThread = (
 
 const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
   ({
+    forkThread: () => Effect.die("Unexpected fork in this test"),
     startSession: () => Effect.die("unused"),
     sendTurn: () => Effect.die("unused"),
     compactThread: () => Effect.die("unused"),

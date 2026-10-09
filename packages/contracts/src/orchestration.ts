@@ -34,6 +34,7 @@ import {
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
+  forkThread: "orchestration.forkThread",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
@@ -1546,6 +1547,8 @@ const ThreadHistoryImportCommand = Schema.Struct({
       messageId: MessageId,
       role: Schema.Literals(["user", "assistant"]),
       text: Schema.String,
+      attachments: Schema.optional(Schema.Array(ChatAttachment)),
+      context: Schema.optional(OrchestrationMessageContext),
       createdAt: IsoDateTime,
     }),
   ).check(Schema.isNonEmpty()),
@@ -2365,6 +2368,10 @@ export class OrchestrationGetWorkflowScriptError extends Schema.TaggedError<Orch
 }
 
 export const OrchestrationRpcSchemas = {
+  forkThread: {
+    input: Schema.Struct({ threadId: ThreadId, targetThreadId: ThreadId, messageId: MessageId }),
+    output: Schema.Void,
+  },
   dispatchCommand: {
     input: ClientOrchestrationCommand,
     output: DispatchResult,

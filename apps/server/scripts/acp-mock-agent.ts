@@ -13,6 +13,15 @@ import * as AcpError from "effect-acp/errors";
 import type * as AcpSchema from "effect-acp/schema";
 
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
+const grokHistoryPath = process.env.T3_ACP_GROK_HISTORY_PATH;
+function readGrokHistory(): Record<string, number> {
+  return grokHistoryPath && NodeFS.existsSync(grokHistoryPath)
+    ? (JSON.parse(NodeFS.readFileSync(grokHistoryPath, "utf8")) as Record<string, number>)
+    : {};
+}
+function writeGrokHistory(history: Record<string, number>): void {
+  if (grokHistoryPath) NodeFS.writeFileSync(grokHistoryPath, JSON.stringify(history));
+}
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
@@ -621,6 +630,11 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+      if (grokHistoryPath) {
+        const history = readGrokHistory();
+        history[requestedSessionId] = (history[requestedSessionId] ?? 0) + 1;
+        writeGrokHistory(history);
+      }
       if (
         process.env.T3_ACP_CRASH_PROMPT === "1" &&
         request.prompt.some((part) => part.type === "text" && part.text === "crash now")
@@ -1387,6 +1401,44 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
+    if (
+      grokHistoryPath &&
+      ["_x.ai/rewind/points", "_x.ai/rewind/execute", "_x.ai/session/fork"].includes(method)
+    ) {
+      const input = params as Record<string, unknown>;
+      if (
+        typeof (method === "_x.ai/session/fork" ? input.sourceSessionId : input.session_id) !==
+        "string"
+      )
+        return Effect.fail(
+          new AcpError.AcpRequestError({ code: -32602, errorMessage: "Invalid parameters" }),
+        );
+      return Effect.sync(() => {
+        const history = readGrokHistory();
+        const id = String(input.session_id ?? input.sourceSessionId);
+        if (method === "_x.ai/rewind/points")
+          return {
+            rewind_points: Array.from({ length: history[id] ?? 0 }, (_, prompt_index) => ({
+              prompt_index,
+            })),
+          };
+        if (method === "_x.ai/session/fork") {
+          const newSessionId = `fork-${id}`;
+          history[newSessionId] = Number(input.targetPromptIndex) + 1;
+          writeGrokHistory(history);
+          return { parentSessionId: id, newSessionId };
+        }
+        if (input.force === true && input.mode === "conversation_only") {
+          history[id] = Number(input.target_prompt_index);
+          writeGrokHistory(history);
+        }
+        return {
+          success: input.force === true,
+          mode: "conversation_only",
+          target_prompt_index: Number(input.target_prompt_index),
+        };
+      });
+    }
     if (method === "_test/environment") {
       return Effect.succeed({
         inherited: process.env.T3_ACP_RUNTIME_AMBIENT === "sentinel",

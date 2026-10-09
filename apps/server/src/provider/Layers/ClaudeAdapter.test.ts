@@ -21,6 +21,7 @@ import {
   ProviderRuntimeEvent,
   type RuntimeMode,
   ThreadId,
+  TurnId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -7088,6 +7089,76 @@ describe("ClaudeAdapterLive", () => {
       Effect.provide(harness.layer),
     );
   });
+
+  it.effect(
+    "forks a completed Claude response without changing its source and protects the inherited prefix",
+    () => {
+      let firstTurnId = "";
+      let secondTurnId = "";
+      const harness = makeHarness({
+        forkSession: async () => ({ sessionId: CLAUDE_FORK_SESSION_ID }),
+        getSessionMessages: async (sessionId) => {
+          const history = [
+            claudeHistoryMessage({ type: "user", uuid: firstTurnId, content: "first" }),
+            claudeHistoryMessage({ type: "assistant", uuid: "answer-first" }),
+            claudeHistoryMessage({ type: "user", uuid: secondTurnId, content: "second" }),
+            claudeHistoryMessage({ type: "assistant", uuid: "answer-second" }),
+          ];
+          return sessionId === CLAUDE_FORK_SESSION_ID
+            ? history.slice(0, 2).map((message) => ({
+                ...message,
+                uuid: `fork-${message.uuid}`,
+                session_id: sessionId,
+              }))
+            : history;
+        },
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          runtimeMode: "full-access",
+        });
+        firstTurnId = (yield* sendCompletedClaudeTurn(adapter, harness, session.threadId, "first"))
+          .turnId;
+        secondTurnId = (yield* sendCompletedClaudeTurn(
+          adapter,
+          harness,
+          session.threadId,
+          "second",
+        )).turnId;
+        const before = (yield* adapter.listSessions())[0]?.resumeCursor;
+        const child = yield* adapter.forkThread!({
+          sourceThreadId: THREAD_ID,
+          targetThreadId: ThreadId.make("fork-child"),
+          sourceTurnId: TurnId.make(firstTurnId),
+          retainedTurnCount: 1,
+        });
+        assert.deepEqual(
+          (yield* adapter.listSessions()).find((entry) => entry.threadId === THREAD_ID)
+            ?.resumeCursor,
+          before,
+        );
+        assert.equal((child.resumeCursor as { inheritedTurnCount: number }).inheritedTurnCount, 1);
+        assert.equal((child.resumeCursor as { resume: string }).resume, CLAUDE_FORK_SESSION_ID);
+        const error = yield* adapter.rollbackThread(child.threadId, 1).pipe(Effect.flip);
+        assert.match(error.message, /inherited/);
+        yield* adapter.stopSession(child.threadId);
+        yield* adapter.startSession({
+          threadId: child.threadId,
+          runtimeMode: "full-access",
+          resumeCursor: child.resumeCursor,
+        });
+        assert.match(
+          (yield* adapter.rollbackThread(child.threadId, 1).pipe(Effect.flip)).message,
+          /inherited/,
+        );
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
 
   it.effect("rewinds a Claude turn that includes tool results and a later steer", () => {
     const forkCalls: Array<Parameters<NonNullable<ClaudeAdapterLiveOptions["forkSession"]>>> = [];

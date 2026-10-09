@@ -2,6 +2,7 @@ import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/unstable/reactivity";
 import {
   WS_METHODS,
+  ORCHESTRATION_WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
 } from "@t3tools/contracts";
@@ -242,6 +243,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     dismissUserInput: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:dismiss-user-input",
       execute: (input: DismissThreadUserInputInput) => dismissThreadUserInput(input),
+      scheduler,
+      concurrency,
+    }),
+    fork: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:fork",
+      tag: ORCHESTRATION_WS_METHODS.forkThread,
       scheduler,
       concurrency,
     }),

@@ -966,9 +966,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     } satisfies Record<string, string>;
   });
 
-  const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
+  const prepareMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    accessThreadId = threadId,
+  ) =>
     Effect.gen(function* () {
-      const capabilities = yield* agentAccessCapabilities(threadId);
+      const capabilities = yield* agentAccessCapabilities(accessThreadId);
       const credential = yield* issueMcpCredential({ threadId, providerInstanceId, capabilities });
       if (credential) {
         const deviceEnvironment = capabilities.has("device")
@@ -1117,6 +1121,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         provider: canonicalEvent.provider,
         eventType: canonicalEvent.type,
       });
+      if (
+        (source.provider === "claudeAgent" || source.provider === "grok") &&
+        (canonicalEvent.type === "turn.started" ||
+          canonicalEvent.type === "turn.completed" ||
+          canonicalEvent.type === "turn.aborted")
+      ) {
+        // Background Claude turns have no sendTurn response to persist their
+        // new native boundary. Save it before clients can checkpoint the turn.
+        yield* Effect.gen(function* () {
+          const adapter = yield* registry.getByInstance(source.instanceId);
+          const session = (yield* adapter.listSessions()).find(
+            (session) => session.threadId === canonicalEvent.threadId,
+          );
+          if (session?.resumeCursor !== undefined) {
+            const binding = yield* directory.getBinding(session.threadId);
+            if (Option.isNone(binding) || binding.value.providerInstanceId !== source.instanceId) {
+              return;
+            }
+            yield* directory.upsert({
+              threadId: session.threadId,
+              provider: source.provider,
+              providerInstanceId: source.instanceId,
+              resumeCursor: session.resumeCursor,
+            });
+          }
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("failed to persist provider turn resume state", { cause }),
+          ),
+        );
+      }
       if (canonicalEvent.type === "turn.started") {
         yield* observeTurnStartedForAnalytics(source, canonicalEvent);
       } else if (canonicalEvent.type === "model.rerouted") {
@@ -1126,35 +1161,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         canonicalEvent.type === "turn.aborted"
       ) {
         yield* recordTurnCompletedAnalytics(source, canonicalEvent);
-        if (source.provider === "claudeAgent") {
-          // Background Claude turns have no sendTurn response to persist their
-          // new native boundary. Save it before clients can checkpoint the turn.
-          yield* Effect.gen(function* () {
-            const adapter = yield* registry.getByInstance(source.instanceId);
-            const session = (yield* adapter.listSessions()).find(
-              (session) => session.threadId === canonicalEvent.threadId,
-            );
-            if (session?.resumeCursor !== undefined) {
-              const binding = yield* directory.getBinding(session.threadId);
-              if (
-                Option.isNone(binding) ||
-                binding.value.providerInstanceId !== source.instanceId
-              ) {
-                return;
-              }
-              yield* directory.upsert({
-                threadId: session.threadId,
-                provider: source.provider,
-                providerInstanceId: source.instanceId,
-                resumeCursor: session.resumeCursor,
-              });
-            }
-          }).pipe(
-            Effect.catch((cause) =>
-              Effect.logWarning("failed to persist Claude turn resume state", { cause }),
-            ),
-          );
-        }
       } else if (canonicalEvent.type === "session.exited") {
         yield* clearTurnAnalyticsSession(source.instanceId, canonicalEvent.threadId);
       }
@@ -1420,7 +1426,25 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
+  const sessionStarts = new Set<ThreadId>();
+  const reserveSessionStart = <A, E>(threadId: ThreadId, work: Effect.Effect<A, E>) =>
+    Effect.gen(function* () {
+      if (sessionStarts.has(threadId))
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          "A provider session is already being initialized for this thread.",
+        );
+      sessionStarts.add(threadId);
+      return yield* work.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            sessionStarts.delete(threadId);
+          }),
+        ),
+      );
+    });
+
+  const startSessionImpl: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
     function* (threadId, rawInput) {
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
@@ -1592,12 +1616,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const startSession: ProviderServiceMethod<"startSession"> = (threadId, input) =>
+    reserveSessionStart(threadId, startSessionImpl(threadId, input));
+
   const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (rawInput) {
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
       schema: ProviderSendTurnInput,
       payload: rawInput,
     });
+
+    if (sessionStarts.has(parsed.threadId))
+      return yield* toValidationError(
+        "ProviderService.sendTurn",
+        "Wait for provider initialization to finish before sending a turn.",
+      );
 
     const attachments = parsed.attachments ?? [];
     if (!parsed.input && attachments.length === 0 && parsed.continuation !== true) {
@@ -2232,6 +2265,97 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
+  const forkThreadImpl: ProviderServiceMethod<"forkThread"> = Effect.fn("forkThread")(
+    function* (input) {
+      if (
+        input.sourceThreadId === input.targetThreadId ||
+        !Number.isSafeInteger(input.retainedTurnCount) ||
+        input.retainedTurnCount < 1
+      ) {
+        return yield* toValidationError(
+          "ProviderService.forkThread",
+          "A fork needs a distinct target and a completed source turn.",
+        );
+      }
+      if (Option.isSome(yield* directory.getBinding(input.targetThreadId))) {
+        return yield* toValidationError(
+          "ProviderService.forkThread",
+          "The fork target already has a provider session.",
+        );
+      }
+      const source = yield* directory.getBinding(input.sourceThreadId);
+      if (Option.isNone(source))
+        return yield* toValidationError(
+          "ProviderService.forkThread",
+          "The source provider session is unavailable.",
+        );
+      const binding = source.value;
+      const instanceId = yield* requireBindingInstanceId("ProviderService.forkThread", binding);
+      const adapter = yield* registry.getByInstance(instanceId);
+      if (!adapter.forkThread)
+        return yield* toValidationError(
+          "ProviderService.forkThread",
+          "This provider does not support native forks.",
+        );
+      const current = (yield* adapter.listSessions()).find(
+        (session) => session.threadId === input.sourceThreadId,
+      );
+      const payload = binding.runtimePayload;
+      const persistedActive =
+        payload !== null &&
+        typeof payload === "object" &&
+        "activeTurnId" in payload &&
+        typeof payload.activeTurnId === "string";
+      if (
+        current ? current.status !== "ready" || current.activeTurnId !== undefined : persistedActive
+      ) {
+        return yield* toValidationError(
+          "ProviderService.forkThread",
+          "Wait for source provider work to finish before forking.",
+        );
+      }
+      const cwd = readPersistedCwd(binding.runtimePayload);
+      const modelSelection = readPersistedModelSelection(binding.runtimePayload);
+      const sourceSessionInput = {
+        threadId: input.sourceThreadId,
+        provider: binding.provider,
+        providerInstanceId: instanceId,
+        runtimeMode: binding.runtimeMode ?? "full-access",
+        ...(cwd ? { cwd } : {}),
+        ...(modelSelection ? { modelSelection } : {}),
+        ...(binding.resumeCursor == null ? {} : { resumeCursor: binding.resumeCursor }),
+      } satisfies ProviderSessionStartInput;
+      // Grok forks directly from storage: loading the dormant source can revive
+      // background monitors. Its adapter receives the opaque persisted cursor.
+      if (!current && binding.provider !== "grok") {
+        yield* recoverSessionForThread({ binding, operation: "ProviderService.forkThread" });
+      }
+      yield* prepareMcpSession(input.targetThreadId, instanceId, input.sourceThreadId);
+      let forked = false;
+      return yield* Effect.gen(function* () {
+        const session = yield* adapter.forkThread!({ ...input, sourceSessionInput });
+        forked = true;
+        const bound = { ...session, providerInstanceId: instanceId };
+        yield* upsertSessionBinding(
+          bound,
+          input.targetThreadId,
+          modelSelection ? { modelSelection } : undefined,
+        );
+        return bound;
+      }).pipe(
+        Effect.onError(() =>
+          Effect.gen(function* () {
+            if (forked) yield* adapter.stopSession(input.targetThreadId).pipe(Effect.ignore);
+            yield* clearMcpSession(input.targetThreadId).pipe(Effect.ignore);
+          }),
+        ),
+      );
+    },
+  );
+
+  const forkThread: ProviderServiceMethod<"forkThread"> = (input) =>
+    reserveSessionStart(input.targetThreadId, forkThreadImpl(input));
+
   const assertConversationRollbackSupported: ProviderServiceMethod<"assertConversationRollbackSupported"> =
     Effect.fn("assertConversationRollbackSupported")(function* (threadId) {
       const routed = yield* resolveRoutableSession({
@@ -2462,6 +2586,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getInstanceInfo,
     assertConversationRollbackSupported,
     rollbackConversation,
+    forkThread,
     uploadFeedback,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each

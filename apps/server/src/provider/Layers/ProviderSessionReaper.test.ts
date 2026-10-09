@@ -190,6 +190,7 @@ describe("ProviderSessionReaper", () => {
     );
 
     const providerService: ProviderServiceShape = {
+      forkThread: () => unsupported(),
       startSession: () => unsupported(),
       sendTurn: () => unsupported(),
       compactThread: () => unsupported(),

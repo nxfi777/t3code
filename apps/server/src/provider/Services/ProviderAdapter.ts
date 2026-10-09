@@ -64,6 +64,17 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderForkThreadInput {
+  readonly sourceThreadId: ThreadId;
+  readonly targetThreadId: ThreadId;
+  readonly sourceTurnId: TurnId;
+  /** Number of source app turns through the selected response. */
+  readonly retainedTurnCount: number;
+  readonly cwd?: string;
+  /** Service-supplied persisted state for adapters that can fork without loading the source. */
+  readonly sourceSessionInput?: ProviderSessionStartInput;
+}
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -130,6 +141,8 @@ export interface ProviderAdapterShape<TError> {
    * Read a provider thread snapshot.
    */
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  readonly forkThread?: (input: ProviderForkThreadInput) => Effect.Effect<ProviderSession, TError>;
 
   /**
    * Roll back a provider thread by N turns.

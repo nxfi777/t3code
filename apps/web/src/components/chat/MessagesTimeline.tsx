@@ -1,4 +1,4 @@
-import { ArrowUpIcon, ClockIcon } from "lucide-react";
+import { ArrowUpIcon, ClockIcon, GitForkIcon } from "lucide-react";
 import { ReadOnlySourcePreview } from "../files/AttachmentFilePreview";
 import { useRightPanelStore } from "~/rightPanelStore";
 import {
@@ -268,6 +268,7 @@ import { ComputerUseAppIcon } from "~/components/Icons";
 // ---------------------------------------------------------------------------
 
 interface TimelineRowSharedState {
+  forkableMessageIds: ReadonlySet<MessageId>;
   citationRequest: AssistantCitationTarget | null;
   listRef: React.RefObject<LegendListRef | null>;
   timestampFormat: TimestampFormat;
@@ -279,6 +280,7 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
+  onForkMessage?: ((messageId: MessageId) => void) | undefined;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
   onRunShellCommand: ((command: string) => void) | undefined;
   onImageExpand: (preview: ExpandedImagePreview) => void;
@@ -428,6 +430,7 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   supportsConversationRollback: boolean;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
+  onForkMessage?: ((messageId: MessageId) => void) | undefined;
   onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
   onRunShellCommand?: (command: string) => void;
   isRevertingCheckpoint: boolean;
@@ -498,6 +501,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   supportsConversationRollback,
   onRevertToTurnCount,
+  onForkMessage,
   onUseArtifactTemplate = NOOP_USE_ARTIFACT_TEMPLATE,
   onRunShellCommand,
   isRevertingCheckpoint,
@@ -1139,6 +1143,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     };
   }, [timelineViewportElement, rows.length, reportContentOverflow, chatWidth]);
 
+  const forkableMessageIds = useMemo(
+    () =>
+      new Set(
+        turnDiffSummaries.flatMap((summary) =>
+          summary.assistantMessageId ? [summary.assistantMessageId] : [],
+        ),
+      ),
+    [turnDiffSummaries],
+  );
+
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       citationRequest: readyCitationRequest,
@@ -1153,6 +1167,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
+      onForkMessage,
+      forkableMessageIds,
       onUseArtifactTemplate,
       onRunShellCommand,
       onImageExpand,
@@ -1189,6 +1205,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
+      onForkMessage,
+      forkableMessageIds,
       onUseArtifactTemplate,
       onRunShellCommand,
       onImageExpand,
@@ -2457,6 +2475,7 @@ function AssistantMessageMeta({
   alwaysVisible?: boolean;
 }) {
   const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
 
   return (
     <div
@@ -2473,6 +2492,25 @@ function AssistantMessageMeta({
         showCopyButton={showCopyButton}
         streaming={copyStreaming}
       />
+      {ctx.onForkMessage && ctx.forkableMessageIds.has(message.id) && !message.streaming ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                disabled={activity.isWorking || activity.isRevertingCheckpoint}
+                onClick={() => ctx.onForkMessage?.(message.id)}
+                aria-label="Fork from here"
+              />
+            }
+          >
+            <GitForkIcon className="size-3" />
+          </TooltipTrigger>
+          <TooltipPopup side="top">Fork from here · keeps current files</TooltipPopup>
+        </Tooltip>
+      ) : null}
       {!message.streaming && (
         <Tooltip>
           <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>

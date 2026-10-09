@@ -22,6 +22,7 @@ import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
+import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
 
 import { parseTurnDiffFilesFromNumstat } from "../../checkpointing/Diffs.ts";
 import {
@@ -40,6 +41,8 @@ import type { OrchestrationDispatchError } from "../Errors.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -86,6 +89,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const projectionTurns = yield* ProjectionTurnRepository;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const receiptBus = yield* RuntimeReceiptBus;
   const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
@@ -425,10 +429,6 @@ const make = Effect.gen(function* () {
         projects,
         preferSessionRuntime: true,
       });
-      if (!checkpointCwd) {
-        return;
-      }
-
       // If a placeholder checkpoint exists for this turn, reuse its turn count
       // instead of incrementing past it.
       const existingPlaceholder = thread.checkpoints.find(
@@ -438,9 +438,132 @@ const make = Effect.gen(function* () {
         (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
         0,
       );
-      const nextTurnCount = existingPlaceholder
+      let nextTurnCount = existingPlaceholder
         ? existingPlaceholder.checkpointTurnCount
         : currentTurnCount + 1;
+
+      if (!checkpointCwd) {
+        if (
+          existingPlaceholder?.checkpointRef ===
+          checkpointRefForThreadTurn(thread.id, nextTurnCount)
+        )
+          return;
+        const turns = yield* projectionTurns.listByThreadId({ threadId: thread.id });
+        const currentTurn = turns.find((turn) => turn.turnId === turnId);
+        const previousTurns = turns
+          .filter((turn) => turn.turnId !== null && turn.turnId !== turnId)
+          .toSorted(
+            (left, right) =>
+              compareDateTimeStrings(left.requestedAt, right.requestedAt) ||
+              compareDateTimeStrings(
+                left.startedAt ?? left.requestedAt,
+                right.startedAt ?? right.requestedAt,
+              ) ||
+              (left.checkpointTurnCount !== null && right.checkpointTurnCount !== null
+                ? left.checkpointTurnCount - right.checkpointTurnCount
+                : 0),
+          );
+        const needsRepair = previousTurns.some(
+          (turn, index) => turn.checkpointTurnCount !== index + 1,
+        );
+        if (needsRepair) {
+          // Old non-Git turns had no checkpoints. Backfill their actual persisted
+          // turn IDs before exposing a new boundary, otherwise revert(0) would
+          // discard the old UI transcript while retaining it in the provider.
+          const ambiguous = previousTurns.some((turn, index) => {
+            const previous = previousTurns[index - 1];
+            return (
+              turn.state === "pending" ||
+              turn.state === "running" ||
+              turn.completedAt === null ||
+              (currentTurn !== undefined &&
+                compareDateTimeStrings(turn.requestedAt, currentTurn.requestedAt) > 0) ||
+              (turn.checkpointTurnCount !== index + 1 &&
+                turn.checkpointStatus !== null &&
+                turn.checkpointStatus !== "missing") ||
+              (previous !== undefined &&
+                compareDateTimeStrings(previous.requestedAt, turn.requestedAt) === 0 &&
+                compareDateTimeStrings(
+                  previous.startedAt ?? previous.requestedAt,
+                  turn.startedAt ?? turn.requestedAt,
+                ) === 0 &&
+                (previous.checkpointTurnCount === null || turn.checkpointTurnCount === null))
+            );
+          });
+          if (ambiguous) {
+            yield* appendCaptureFailureActivity({
+              threadId: thread.id,
+              turnId,
+              detail:
+                "Conversation history cannot be safely indexed. Earlier turns have ambiguous boundaries or Git checkpoints that cannot be renumbered.",
+              createdAt: event.createdAt,
+            });
+            return;
+          }
+          // Move later missing entries first so the projection's unique count
+          // constraint does not clear a boundary that has already been repaired.
+          for (let index = previousTurns.length - 1; index >= 0; index--) {
+            const turn = previousTurns[index]!;
+            if (turn.turnId === null || turn.checkpointTurnCount === index + 1) continue;
+            yield* orchestrationEngine.dispatch({
+              type: "thread.turn.diff.complete",
+              commandId: yield* serverCommandId("conversation-history-backfill"),
+              threadId: thread.id,
+              turnId: turn.turnId,
+              completedAt: turn.completedAt!,
+              checkpointRef: checkpointRefForThreadTurn(thread.id, index + 1),
+              status: turn.state === "error" ? "error" : "missing",
+              files: turn.checkpointFiles,
+              assistantMessageId:
+                turn.assistantMessageId ?? MessageId.make(`assistant:${turn.turnId}`),
+              checkpointTurnCount: index + 1,
+              createdAt: event.createdAt,
+            });
+          }
+        }
+        nextTurnCount = previousTurns.length + 1;
+        // Conversation history exists without Git. A canonical missing ref marks
+        // a finalized boundary; provider-diff refs remain provisional until here.
+        const checkpointRef = checkpointRefForThreadTurn(thread.id, nextTurnCount);
+        const status =
+          event.type === "turn.completed" && event.payload.state === "failed" ? "error" : "missing";
+        const assistantMessageId =
+          thread.messages
+            .toReversed()
+            .find((message) => message.role === "assistant" && message.turnId === turnId)?.id ??
+          existingPlaceholder?.assistantMessageId ??
+          MessageId.make(`assistant:${turnId}`);
+        yield* orchestrationEngine.dispatch({
+          type: "thread.turn.diff.complete",
+          commandId: yield* serverCommandId("conversation-turn-diff-complete"),
+          threadId: thread.id,
+          turnId,
+          completedAt: event.createdAt,
+          checkpointRef,
+          status,
+          files: existingPlaceholder?.files ?? [],
+          assistantMessageId,
+          checkpointTurnCount: nextTurnCount,
+          createdAt: event.createdAt,
+        });
+        yield* receiptBus.publish({
+          type: "checkpoint.diff.finalized",
+          threadId: thread.id,
+          turnId,
+          checkpointTurnCount: nextTurnCount,
+          checkpointRef,
+          status,
+          createdAt: event.createdAt,
+        });
+        yield* receiptBus.publish({
+          type: "turn.processing.quiesced",
+          threadId: thread.id,
+          turnId,
+          checkpointTurnCount: nextTurnCount,
+          createdAt: event.createdAt,
+        });
+        return;
+      }
 
       yield* captureAndDispatchCheckpoint({
         threadId: thread.id,
@@ -696,6 +819,7 @@ const make = Effect.gen(function* () {
       (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
       0,
     );
+
     const baselineCheckpointRef = checkpointRefForThreadTurn(threadId, currentTurnCount);
     const baselineExists = yield* checkpointStore.hasCheckpointRef({
       cwd: checkpointCwd,
@@ -795,6 +919,37 @@ const make = Effect.gen(function* () {
       0,
     );
 
+    {
+      const turns = (yield* projectionTurns.listByThreadId({ threadId: thread.id }))
+        .filter((turn) => turn.turnId !== null)
+        .toSorted(
+          (left, right) =>
+            compareDateTimeStrings(left.requestedAt, right.requestedAt) ||
+            compareDateTimeStrings(
+              left.startedAt ?? left.requestedAt,
+              right.startedAt ?? right.requestedAt,
+            ) ||
+            (left.checkpointTurnCount ?? 0) - (right.checkpointTurnCount ?? 0),
+        );
+      if (
+        turns.some(
+          (turn, index) =>
+            turn.checkpointTurnCount !== index + 1 ||
+            turn.state === "running" ||
+            turn.state === "pending",
+        )
+      ) {
+        yield* appendRevertFailureActivity({
+          threadId: thread.id,
+          turnCount: event.payload.turnCount,
+          detail:
+            "Conversation history has unindexed turns. Complete another turn to repair its boundaries before editing earlier messages.",
+          createdAt: now,
+        });
+        return;
+      }
+    }
+
     if (event.payload.turnCount > currentTurnCount) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
@@ -808,6 +963,18 @@ const make = Effect.gen(function* () {
     yield* providerService.assertConversationRollbackSupported(event.payload.threadId);
 
     if (event.payload.restoreFiles !== false) {
+      const providerInfo = yield* providerService.getInstanceInfo(
+        thread.session?.providerInstanceId ?? thread.modelSelection.instanceId,
+      );
+      if (providerInfo.driverKind === "grok") {
+        yield* appendRevertFailureActivity({
+          threadId: thread.id,
+          turnCount: event.payload.turnCount,
+          detail: "Grok supports conversation-only rewind. Choose Revert and keep changes.",
+          createdAt: now,
+        });
+        return;
+      }
       if (!checkpointCwd) {
         yield* appendRevertFailureActivity({
           threadId: event.payload.threadId,
@@ -1060,4 +1227,6 @@ const make = Effect.gen(function* () {
   } satisfies CheckpointReactorShape;
 });
 
-export const CheckpointReactorLive = Layer.effect(CheckpointReactor, make);
+export const CheckpointReactorLive = Layer.effect(CheckpointReactor, make).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+);

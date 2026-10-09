@@ -123,6 +123,7 @@ function createProviderServiceHarness() {
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
   const service: ProviderServiceShape = {
+    forkThread: () => Effect.die("Unexpected fork in this test"),
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
     compactThread: () => unsupported(),

@@ -1541,6 +1541,9 @@ export default function ChatView(props: ChatViewProps) {
   const dismissThreadUserInput = useAtomCommand(threadEnvironment.dismissUserInput, {
     reportFailure: false,
   });
+  const forkThread = useAtomCommand(threadEnvironment.fork, { reportFailure: false });
+  const [isForkingThread, setIsForkingThread] = useState(false);
+  const forkInFlightRef = useRef(false);
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
@@ -7149,6 +7152,58 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
 
+  const onForkMessage = useCallback(
+    async (messageId: MessageId) => {
+      if (
+        !activeThread ||
+        forkInFlightRef.current ||
+        isRevertingCheckpoint ||
+        isSendBusy ||
+        isConnecting ||
+        phase === "running"
+      )
+        return;
+      forkInFlightRef.current = true;
+      setIsForkingThread(true);
+      setThreadError(activeThread.id, null);
+      try {
+        const targetThreadId = newThreadId();
+        const result = await forkThread({
+          environmentId,
+          input: { threadId: activeThread.id, targetThreadId, messageId },
+        });
+        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+        await waitForStartedServerThread(scopeThreadRef(environmentId, targetThreadId));
+        if (currentRouteThreadKeyRef.current === routeThreadKey) {
+          await navigate({
+            to: "/$environmentId/$threadId",
+            params: { environmentId, threadId: targetThreadId },
+          });
+        }
+      } catch (error) {
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Failed to fork the conversation.",
+        );
+      } finally {
+        forkInFlightRef.current = false;
+        setIsForkingThread(false);
+      }
+    },
+    [
+      activeThread,
+      environmentId,
+      forkThread,
+      isRevertingCheckpoint,
+      isSendBusy,
+      isConnecting,
+      phase,
+      routeThreadKey,
+      navigate,
+      setThreadError,
+    ],
+  );
+
   const onCompactContext = async () => {
     if (compactDisabled || !activeThread || !clientSettingsHydrated || sendInFlightRef.current) {
       return;
@@ -9867,7 +9922,17 @@ export default function ChatView(props: ChatViewProps) {
                 onRevertToTurnCount={
                   paintOnlyDisplayedTimeline ? noopHeldRevert : onRevertTimelineTurn
                 }
-                isRevertingCheckpoint={!paintOnlyDisplayedTimeline && isRevertingCheckpoint}
+                onForkMessage={
+                  !paintOnlyDisplayedTimeline &&
+                  ["codex", "claudeAgent", "grok"].includes(
+                    lockedProvider ?? selectedProvider ?? "",
+                  )
+                    ? onForkMessage
+                    : undefined
+                }
+                isRevertingCheckpoint={
+                  !paintOnlyDisplayedTimeline && (isRevertingCheckpoint || isForkingThread)
+                }
                 onImageExpand={onExpandTimelineImage}
                 onFileOpen={paintOnlyDisplayedTimeline ? noopHeldAttachment : openFileAttachment}
                 onFileDownload={
@@ -10384,7 +10449,7 @@ export default function ChatView(props: ChatViewProps) {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
-            {activeWorktreePath !== null ? (
+            {activeWorktreePath !== null && (lockedProvider ?? selectedProvider) !== "grok" ? (
               <Button
                 variant="destructive"
                 onClick={() => {

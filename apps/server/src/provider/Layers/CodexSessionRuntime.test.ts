@@ -4,7 +4,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { describe } from "vite-plus/test";
-import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_MODEL, ThreadId, TurnId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
@@ -23,11 +23,61 @@ import {
   openCodexThread,
   readCodexThread,
   rollbackCodexThread,
+  forkCodexThread,
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
 describe("Codex thread history", () => {
+  for (const honorsBoundary of [true, false]) {
+    it.effect(`forks an independent Codex prefix (native boundary: ${honorsBoundary})`, () =>
+      Effect.gen(function* () {
+        const source = ["turn-1", "turn-2", "turn-3"];
+        let child: string[] = [];
+        const mutations: string[] = [];
+        const client: Parameters<typeof forkCodexThread>[0] = {
+          request: () => Effect.die("Unexpected legacy read"),
+          raw: {
+            request: (method, payload) =>
+              Effect.sync(() => {
+                const params = payload as {
+                  threadId: string;
+                  lastTurnId?: string;
+                  beforeTurnId?: string;
+                };
+                if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+                if (method === "thread/turns/list")
+                  return {
+                    data: (params.threadId === "source" ? source : child).map((id) => ({
+                      id,
+                      items: [],
+                      status: "completed",
+                    })),
+                    nextCursor: null,
+                  };
+                if (method === "thread/fork") {
+                  NodeAssert.equal(params.lastTurnId, "turn-2");
+                  child = source.slice(0, honorsBoundary ? 2 : 3);
+                  return { thread: { id: "child" } };
+                }
+                NodeAssert.equal(method, "thread/revert");
+                mutations.push(params.threadId);
+                child = child.slice(0, child.indexOf(params.beforeTurnId!));
+                return {};
+              }),
+          },
+        };
+        NodeAssert.deepEqual(yield* forkCodexThread(client, "source", TurnId.make("turn-2")), {
+          threadId: "child",
+          inheritedTurnCount: 2,
+        });
+        NodeAssert.deepEqual(source, ["turn-1", "turn-2", "turn-3"]);
+        NodeAssert.deepEqual(child, ["turn-1", "turn-2"]);
+        NodeAssert.deepEqual(mutations, honorsBoundary ? [] : ["child"]);
+        yield* Effect.flip(forkCodexThread(client, "source", TurnId.make("missing")));
+      }),
+    );
+  }
   for (const numTurns of [1, 2, 3, 5]) {
     it.effect(`reverts ${numTurns} paginated turns at the durable boundary`, () =>
       Effect.gen(function* () {
@@ -901,6 +951,36 @@ describe("isRecoverableThreadResumeError", () => {
 });
 
 describe("openCodexThread", () => {
+  it.effect.each(["missing", "different"] as const)(
+    "rejects %s native fork history without starting fresh",
+    (failure) =>
+      Effect.gen(function* () {
+        const error = yield* openCodexThread({
+          client: {
+            request: () => Effect.die("A fork must never replace its provider history"),
+            raw: {
+              request: () =>
+                failure === "missing"
+                  ? Effect.fail(
+                      new CodexErrors.CodexAppServerRequestError({
+                        code: -32603,
+                        errorMessage: "thread not found",
+                      }),
+                    )
+                  : Effect.succeed(makeThreadOpenResponse("other-thread")),
+            },
+          },
+          threadId: ThreadId.make("fork-thread"),
+          runtimeMode: "full-access",
+          cwd: "/tmp/project",
+          requestedModel: undefined,
+          serviceTier: undefined,
+          resumeThreadId: "fork-native-thread",
+          requireResume: true,
+        }).pipe(Effect.flip);
+        NodeAssert.ok(isCodexAppServerRequestError(error));
+      }),
+  );
   it.effect("resumes metadata when historical turns contain unknown error values", () =>
     Effect.gen(function* () {
       const response = makeThreadOpenResponse("saved-thread");

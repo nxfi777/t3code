@@ -1,6 +1,7 @@
 import {
   ApprovalRequestId,
   DEFAULT_MODEL,
+  NonNegativeInt,
   EventId,
   ProviderDriverKind,
   ProviderItemId,
@@ -83,6 +84,7 @@ function configuredMcpToolAvailability(
 
 export const CodexResumeCursorSchema = Schema.Struct({
   threadId: Schema.String,
+  inheritedTurnCount: Schema.optional(NonNegativeInt),
 });
 const CodexUserInputAnswerObject = Schema.Struct({
   answers: Schema.Array(Schema.String),
@@ -161,6 +163,9 @@ const CodexChildResumeMetadata = Schema.Struct({
   reasoningEffort: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 const decodeCodexChildResumeMetadata = Schema.decodeUnknownEffect(CodexChildResumeMetadata);
+const decodeCodexForkResponse = Schema.decodeUnknownEffect(
+  Schema.Struct({ thread: Schema.Struct({ id: Schema.String }) }),
+);
 
 export type CodexTurnStartParamsWithCollaborationMode =
   typeof CodexTurnStartParamsWithCollaborationMode.Type;
@@ -182,6 +187,8 @@ export interface CodexSessionRuntimeOptions {
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
+  /** Create the fork inside its destination process so it owns the native writer. */
+  readonly forkFrom?: { readonly threadId: string; readonly turnId: TurnId };
   readonly appServerArgs?: ReadonlyArray<string>;
   /** The provider's model list; supplies the display name for runtime info. */
   readonly models?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
@@ -740,6 +747,7 @@ export const openCodexThread = (input: {
   readonly requestedModel: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
+  readonly requireResume?: boolean;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
   const startParams = buildThreadStartParams({
@@ -774,14 +782,26 @@ export const openCodexThread = (input: {
           ),
         ),
       ),
-      Effect.catchIf(isRecoverableThreadResumeError, (error) =>
-        Effect.logWarning("codex app-server thread resume fell back to fresh start", {
-          threadId: input.threadId,
-          requestedRuntimeMode: input.runtimeMode,
-          resumeThreadId,
-          recoverable: true,
-          cause: error,
-        }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
+      Effect.flatMap((opened) =>
+        input.requireResume && opened.thread.id !== resumeThreadId
+          ? Effect.fail(
+              new CodexErrors.CodexAppServerRequestError({
+                code: -32603,
+                errorMessage: "Codex resumed a different thread than the required fork history.",
+              }),
+            )
+          : Effect.succeed(opened),
+      ),
+      Effect.catchIf(
+        (error) => !input.requireResume && isRecoverableThreadResumeError(error),
+        (error) =>
+          Effect.logWarning("codex app-server thread resume fell back to fresh start", {
+            threadId: input.threadId,
+            requestedRuntimeMode: input.runtimeMode,
+            resumeThreadId,
+            recoverable: true,
+            cause: error,
+          }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
       ),
     );
 };
@@ -1296,6 +1316,49 @@ export const rollbackCodexThread = Effect.fn("rollbackCodexThread")(function* (
   return { threadId, turns: snapshot.turns.slice(0, retainedCount) };
 });
 
+export const forkCodexThread = Effect.fn("forkCodexThread")(function* (
+  client: CodexHistoryClient,
+  providerThreadId: string,
+  sourceTurnId: TurnId,
+  cwd?: string,
+): Effect.fn.Return<CodexResumeCursor, CodexErrors.CodexAppServerError> {
+  const source = yield* readCodexThread(client, providerThreadId);
+  const index = source.turns.findIndex((turn) => turn.id === sourceTurnId);
+  if (index < 0)
+    return yield* CodexErrors.CodexAppServerRequestError.internalError(
+      "The selected Codex turn is unavailable.",
+    );
+  const fork = yield* decodeCodexForkResponse(
+    yield* client.raw.request("thread/fork", {
+      threadId: providerThreadId,
+      lastTurnId: sourceTurnId,
+      ...(cwd ? { cwd } : {}),
+    }),
+  ).pipe(
+    Effect.mapError((cause) =>
+      CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
+        "decode-response-payload",
+        cause,
+        { method: "thread/fork" },
+      ),
+    ),
+  );
+  if (fork.thread.id === providerThreadId)
+    return yield* CodexErrors.CodexAppServerRequestError.internalError(
+      "Codex did not return an independent fork.",
+    );
+  let child = yield* readCodexThread(client, fork.thread.id);
+  // Older CLIs may ignore lastTurnId. Trim only the independent child,
+  // using verified native IDs/counts, and never the source thread.
+  if (child.turns.length > index + 1)
+    child = yield* rollbackCodexThread(client, fork.thread.id, child.turns.length - index - 1);
+  if (child.turns.length !== index + 1 || child.turns[index]?.id !== sourceTurnId)
+    return yield* CodexErrors.CodexAppServerRequestError.internalError(
+      "Codex fork did not preserve the requested turn boundary.",
+    );
+  return { threadId: fork.thread.id, inheritedTurnCount: child.turns.length };
+});
+
 export const makeCodexSessionRuntime = (
   options: CodexSessionRuntimeOptions,
 ): Effect.Effect<
@@ -1305,6 +1368,7 @@ export const makeCodexSessionRuntime = (
 > =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    let resumeCursor = options.resumeCursor;
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
     const events = yield* Queue.unbounded<ProviderEvent>();
@@ -2046,7 +2110,7 @@ export const makeCodexSessionRuntime = (
             return Effect.void;
           }
           return updateSession(sessionRef, {
-            resumeCursor: { threadId: payload.thread.id },
+            resumeCursor: { ...resumeCursor, threadId: payload.thread.id },
           });
         }),
       ),
@@ -2485,6 +2549,15 @@ export const makeCodexSessionRuntime = (
 
       const requestedModel = normalizeCodexModelSlug(options.model);
 
+      if (options.forkFrom) {
+        resumeCursor = yield* forkCodexThread(
+          client,
+          options.forkFrom.threadId,
+          options.forkFrom.turnId,
+          options.cwd,
+        );
+      }
+
       const opened = yield* openCodexThread({
         client,
         threadId: options.threadId,
@@ -2492,7 +2565,9 @@ export const makeCodexSessionRuntime = (
         cwd: options.cwd,
         requestedModel,
         serviceTier: options.serviceTier,
-        resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+        resumeThreadId: readResumeCursorThreadId(resumeCursor),
+        requireResume:
+          options.forkFrom !== undefined || (resumeCursor?.inheritedTurnCount ?? 0) > 0,
       });
 
       const providerThreadId = opened.thread.id;
@@ -2501,7 +2576,7 @@ export const makeCodexSessionRuntime = (
         status: "ready",
         cwd: opened.cwd,
         model: opened.model,
-        resumeCursor: { threadId: providerThreadId },
+        resumeCursor: { ...resumeCursor, threadId: providerThreadId },
         updatedAt: yield* nowIso,
       } satisfies ProviderSession;
       yield* Ref.set(sessionRef, session);
@@ -2607,7 +2682,7 @@ export const makeCodexSessionRuntime = (
             threadId: options.threadId,
             turnId,
             ...(resumedProviderThreadId
-              ? { resumeCursor: { threadId: resumedProviderThreadId } }
+              ? { resumeCursor: { ...resumeCursor, threadId: resumedProviderThreadId } }
               : {}),
           } satisfies ProviderTurnStartResult;
         }),
@@ -2661,6 +2736,13 @@ export const makeCodexSessionRuntime = (
       rollbackThread: (numTurns) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
+          if ((resumeCursor?.inheritedTurnCount ?? 0) > 0) {
+            const before = yield* readCodexThread(client, providerThreadId);
+            if (before.turns.length - numTurns < resumeCursor!.inheritedTurnCount!)
+              return yield* CodexErrors.CodexAppServerRequestError.internalError(
+                "Cannot rewind inherited Codex history.",
+              );
+          }
           const snapshot = yield* rollbackCodexThread(client, providerThreadId, numTurns);
           yield* updateSession(sessionRef, {
             status: "ready",

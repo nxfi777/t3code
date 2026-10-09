@@ -116,6 +116,25 @@ resending. Any unsent draft stays above the restored prompt.
 This removes the selected message and later conversation from the active thread
 and provider history. It does not undo external actions or separate provider
 memory. The action is available only when the provider supports rewind.
+Grok rewinds conversation history while keeping files as they are. Grok turns
+recorded before native history tracking was enabled may not have a verified
+boundary and cannot be rewound or forked safely.
+
+Older chats outside Git repositories may need one more completed turn before
+their earlier history becomes available for editing or forking. T3 reconstructs
+boundaries from saved turn records and refuses the action if their order is ambiguous.
+
+## Fork a conversation
+
+On web and desktop, choose **Fork from here** beneath a completed response to
+continue in a new thread with Claude Code, Codex, or Grok. The original conversation
+stays intact. The fork shares the current workspace files; it does not restore an
+earlier filesystem state.
+
+Inherited messages provide context in the new thread. To branch from a different
+earlier point, return to the original thread. New messages in the fork can be edited
+or forked again. The official mobile app can open and continue these threads; its
+existing interface does not gain the desktop fork action.
 
 ## Prompt stash
 

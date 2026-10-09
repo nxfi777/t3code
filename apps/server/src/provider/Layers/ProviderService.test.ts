@@ -58,6 +58,7 @@ import {
   ProviderUnsupportedError,
   ProviderValidationError,
   ProviderWorkspaceMissingError,
+  ProviderSessionDirectoryPersistenceError,
   type ProviderAdapterError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
@@ -270,6 +271,20 @@ function makeFakeCodexAdapter(
     }),
   );
 
+  const forkThread = vi.fn(
+    (
+      input: Parameters<NonNullable<ProviderAdapterShape<ProviderAdapterError>["forkThread"]>>[0],
+    ) => {
+      const source = sessions.get(input.sourceThreadId)!;
+      return startSession({
+        threadId: input.targetThreadId,
+        runtimeMode: source.runtimeMode,
+        ...(source.cwd ? { cwd: source.cwd } : {}),
+        resumeCursor: { nativeFork: input.sourceTurnId },
+      });
+    },
+  );
+
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
     capabilities: {
@@ -294,6 +309,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    ...(provider === CODEX_DRIVER ? { forkThread } : {}),
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
@@ -331,6 +347,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    forkThread,
     uploadFeedback,
     stopAll,
   };
@@ -2684,6 +2701,81 @@ routing.layer("ProviderServiceLive routing", (it) => {
           `window-text-${index}-12345678-1234-1234-1234-123456789abc.png`,
         );
       }
+    }),
+  );
+
+  it.effect(
+    "reserves a fork target against concurrent starts and releases it on cancellation",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const sourceThreadId = asThreadId("fork-reservation-source");
+        const targetThreadId = asThreadId("fork-reservation-target");
+        yield* provider.startSession(sourceThreadId, {
+          threadId: sourceThreadId,
+          providerInstanceId: codexInstanceId,
+          runtimeMode: "full-access",
+          cwd: fixtureCwd("fork-reservation"),
+        });
+        const entered = yield* Deferred.make<void>();
+        routing.codex.forkThread.mockImplementationOnce(() =>
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        );
+        const input = {
+          sourceThreadId,
+          targetThreadId,
+          sourceTurnId: asTurnId("turn-1"),
+          retainedTurnCount: 1,
+        };
+        const pending = yield* provider.forkThread(input).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* provider
+          .startSession(targetThreadId, {
+            threadId: targetThreadId,
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.flip);
+        yield* provider
+          .sendTurn({ threadId: targetThreadId, input: "must wait" })
+          .pipe(Effect.flip);
+        yield* provider.forkThread(input).pipe(Effect.flip);
+        yield* Fiber.interrupt(pending);
+        const child = yield* provider.forkThread(input);
+        assert.equal(child.threadId, targetThreadId);
+      }),
+  );
+
+  it.effect("persists a native fork separately and rejects an existing target", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const initial = yield* provider.startSession(asThreadId("fork-source"), {
+        threadId: asThreadId("fork-source"),
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        cwd: fixtureCwd("fork-project"),
+      });
+      const input = {
+        sourceThreadId: initial.threadId,
+        targetThreadId: asThreadId("fork-target"),
+        sourceTurnId: asTurnId("turn-1"),
+        retainedTurnCount: 1,
+      };
+      const child = yield* provider.forkThread(input);
+      assert.equal(child.providerInstanceId, codexInstanceId);
+      assert.equal(child.threadId, input.targetThreadId);
+      const saved = yield* runtimeRepository.getByThreadId({ threadId: child.threadId });
+      assert.isTrue(Option.isSome(saved));
+      if (Option.isSome(saved)) assert.deepEqual(saved.value.resumeCursor, child.resumeCursor);
+      assert.deepEqual(
+        (yield* provider.listSessions()).find((session) => session.threadId === initial.threadId)
+          ?.resumeCursor,
+        initial.resumeCursor,
+      );
+      const before = routing.codex.forkThread.mock.calls.length;
+      yield* provider.forkThread(input).pipe(Effect.flip);
+      assert.equal(routing.codex.forkThread.mock.calls.length, before);
     }),
   );
 
@@ -5059,6 +5151,56 @@ boundedListing.layer("ProviderServiceLive session listing", (it) => {
 });
 
 const decodeBrowserAccessThreadShell = Schema.decodeUnknownEffect(OrchestrationThreadShell);
+
+const failedForkSourceId = asThreadId("failed-fork-source");
+const failedForkTargetId = asThreadId("failed-fork-target");
+const failedForkPersistence = makeProviderServiceLayer({
+  directory: {
+    upsert: (binding) =>
+      binding.threadId === failedForkTargetId
+        ? Effect.fail(
+            new ProviderSessionDirectoryPersistenceError({
+              operation: "upsert",
+              detail: "Injected target write failure",
+            }),
+          )
+        : Effect.void,
+    recordImportedTranscript: () => Effect.void,
+    getProvider: () => Effect.succeed(CODEX_DRIVER),
+    getBinding: (threadId) =>
+      Effect.succeed(
+        threadId === failedForkSourceId
+          ? Option.some({ threadId, provider: CODEX_DRIVER, providerInstanceId: codexInstanceId })
+          : Option.none(),
+      ),
+    listThreadIds: () => Effect.succeed([failedForkSourceId]),
+    listBindings: () => Effect.succeed([]),
+  },
+});
+failedForkPersistence.layer("ProviderService fork cleanup", (it) => {
+  it.effect("stops only the child when persisting its native fork fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* failedForkPersistence.codex.startSession({
+        threadId: failedForkSourceId,
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        cwd: fixtureCwd("fork-failure"),
+      });
+      yield* provider
+        .forkThread({
+          sourceThreadId: failedForkSourceId,
+          targetThreadId: failedForkTargetId,
+          sourceTurnId: asTurnId("turn-1"),
+          retainedTurnCount: 1,
+        })
+        .pipe(Effect.flip);
+      assert.isFalse(yield* failedForkPersistence.codex.hasSession(failedForkTargetId));
+      assert.isTrue(yield* failedForkPersistence.codex.hasSession(failedForkSourceId));
+      assert.deepEqual(failedForkPersistence.codex.stopSession.mock.calls, [[failedForkTargetId]]);
+    }),
+  );
+});
 
 describe("agent browser access", () => {
   const projectId = ProjectId.make("project-browser-access");

@@ -2262,7 +2262,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
-  const startSession: CodexAdapterShape["startSession"] = (input) =>
+  const startSession = (
+    input: Parameters<CodexAdapterShape["startSession"]>[0],
+    forkFrom?: CodexSessionRuntimeOptions["forkFrom"],
+  ): ReturnType<CodexAdapterShape["startSession"]> =>
     Effect.scoped(
       Effect.gen(function* () {
         if (input.provider !== undefined && input.provider !== PROVIDER) {
@@ -2315,6 +2318,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(isCodexResumeCursorSchema(input.resumeCursor)
             ? { resumeCursor: input.resumeCursor }
             : {}),
+          ...(forkFrom ? { forkFrom } : {}),
           runtimeMode: input.runtimeMode,
           ...(input.modelSelection?.instanceId === boundInstanceId
             ? { model: input.modelSelection.model }
@@ -2676,6 +2680,40 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       })),
     );
 
+  const forkThread: NonNullable<CodexAdapterShape["forkThread"]> = (input) =>
+    Effect.gen(function* () {
+      const source = yield* requireSession(input.sourceThreadId);
+      const session = yield* source.runtime.getSession;
+      if (
+        session.status !== "ready" ||
+        session.activeTurnId !== undefined ||
+        sessions.has(input.targetThreadId)
+      )
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "forkThread",
+          issue: "Fork requires an idle source and an unused target.",
+        });
+      if (!isCodexResumeCursorSchema(session.resumeCursor))
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "forkThread",
+          issue: "The source Codex thread has no native resume cursor.",
+        });
+      // thread/fork loads the child and acquires its writer lock. Run it in
+      // the new process that will own the child, never in the source process.
+      return yield* startSession(
+        {
+          ...source.startInput,
+          ...input.sourceSessionInput,
+          threadId: input.targetThreadId,
+          ...(input.cwd ? { cwd: input.cwd } : {}),
+          resumeCursor: undefined,
+        },
+        { threadId: session.resumeCursor.threadId, turnId: input.sourceTurnId },
+      );
+    });
+
   const rollbackThread: CodexAdapterShape["rollbackThread"] = (threadId, numTurns) => {
     if (!Number.isInteger(numTurns) || numTurns < 1) {
       return Effect.fail(
@@ -2811,6 +2849,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     interruptTurn,
     readThread,
     rollbackThread,
+    forkThread,
     uploadFeedback,
     respondToRequest,
     respondToUserInput,

@@ -123,7 +123,9 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
           Effect.provideService(Path.Path, path),
         ),
       );
+      let supportsHistory = false;
       const adapter = yield* makeGrokAdapter(effectiveConfig, {
+        historySupported: () => supportsHistory,
         environment: processEnv,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
@@ -131,6 +133,11 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
       const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv);
 
       const checkProvider = checkGrokProviderStatus(effectiveConfig, processEnv, cwd).pipe(
+        Effect.tap((checked) =>
+          Effect.sync(() => {
+            supportsHistory = checked.supportsConversationRollback === true;
+          }),
+        ),
         Effect.filterOrElse(
           (snapshot) =>
             !(

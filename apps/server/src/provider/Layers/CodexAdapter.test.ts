@@ -319,6 +319,50 @@ const sessionErrorLayer = it.layer(
 );
 
 sessionErrorLayer("CodexAdapterLive session errors", (it) => {
+  it.effect(
+    "creates native forks in the destination runtime without transferring a writer lock",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const sourceId = asThreadId("fork-source");
+        const targetId = asThreadId("fork-target");
+        const session = yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: sourceId,
+          runtimeMode: "full-access",
+          cwd: "/tmp/fork-test",
+        });
+        const source = sessionRuntimeFactory.lastRuntime!;
+        const { model, ...sessionFields } = session;
+        const nativeSession = {
+          ...sessionFields,
+          ...(model === undefined ? {} : { model }),
+          status: "ready" as const,
+          cwd: "/tmp/fork-test",
+          resumeCursor: { threadId: "native-source" },
+        };
+        source.startImpl.mockResolvedValue(nativeSession);
+        NodeAssert.ok(adapter.forkThread);
+        yield* adapter.forkThread({
+          sourceThreadId: sourceId,
+          targetThreadId: targetId,
+          sourceTurnId: asTurnId("native-turn-1"),
+          retainedTurnCount: 1,
+        });
+        const target = sessionRuntimeFactory.lastRuntime!;
+        NodeAssert.notEqual(target, source);
+        NodeAssert.equal(target.options.threadId, targetId);
+        NodeAssert.equal(target.options.resumeCursor, undefined);
+        NodeAssert.deepEqual(target.options.forkFrom, {
+          threadId: "native-source",
+          turnId: "native-turn-1",
+        });
+        NodeAssert.equal(source.closeImpl.mock.calls.length, 0);
+        NodeAssert.equal(source.readThreadImpl.mock.calls.length, 0);
+        NodeAssert.equal(source.rollbackThreadImpl.mock.calls.length, 0);
+      }),
+  );
+
   it.effect("maps missing adapter sessions to ProviderAdapterSessionNotFoundError", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;

@@ -84,6 +84,18 @@ import {
   XAiExitPlanModeRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
+import {
+  captureGrokPromptEcho,
+  forkGrokHistory,
+  markGrokPrompt,
+  probeGrokHistoryExtensions,
+  readGrokPromptCount,
+  readGrokResume,
+  rewindGrokHistory,
+  sealGrokBoundary,
+  type GrokHistory,
+  type GrokPendingBoundary,
+} from "../acp/GrokAcpHistory.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -106,6 +118,7 @@ function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
 }
 
 export interface GrokAdapterLiveOptions {
+  readonly historySupported?: () => boolean;
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
@@ -142,6 +155,10 @@ interface GrokSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  history: GrokHistory;
+  pendingHistory: GrokPendingBoundary | undefined;
+  readonly historySupported: boolean;
+  readonly startInput: Parameters<GrokAdapterShape["startSession"]>[0];
   lastPlanFingerprint: string | undefined;
   /**
    * Latest plan.md body + turn it was emitted for. Dedupe is turn-scoped so a
@@ -280,11 +297,24 @@ const resolveSessionCallbackTurnId = (
   return ctx ? resolveCallbackTurnId(ctx) : undefined;
 };
 
-function parseGrokResume(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
-  if (raw.schemaVersion !== GROK_RESUME_VERSION) return undefined;
-  if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
-  return { sessionId: raw.sessionId.trim() };
+function updateHistoryCursor(ctx: GrokSessionContext): void {
+  ctx.session = {
+    ...ctx.session,
+    resumeCursor: {
+      schemaVersion: GROK_RESUME_VERSION,
+      sessionId: ctx.acpSessionId,
+      history: ctx.history,
+    },
+  };
+}
+
+function mapAcpHistoryError(
+  threadId: ThreadId,
+  cause: EffectAcpErrors.AcpError | ProviderAdapterRequestError,
+) {
+  return cause._tag === "ProviderAdapterRequestError"
+    ? cause
+    : mapAcpToAdapterError(PROVIDER, threadId, "grok/history", cause);
 }
 
 export function selectGrokPermissionOptionId(
@@ -988,7 +1018,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
-          const resumeSessionId = parseGrokResume(input.resumeCursor)?.sessionId;
+          const resume = readGrokResume(input.resumeCursor);
+          const resumeSessionId = resume?.sessionId;
           const acpNativeLoggers = makeAcpNativeLoggers({
             nativeEventLogger,
             provider: PROVIDER,
@@ -1028,6 +1059,12 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   ],
                 }
               : {}),
+            transformSessionUpdate: (notification) => {
+              const current = sessions.get(input.threadId);
+              if (current?.acpSessionId === notification.sessionId)
+                captureGrokPromptEcho(current.pendingHistory, notification);
+              return notification;
+            },
             ...acpNativeLoggers,
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
@@ -1269,6 +1306,12 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
           });
 
+          const historySupported = yield* probeGrokHistoryExtensions(acp);
+          const history: GrokHistory = resume?.history ?? {
+            ...(resumeSessionId === undefined ? { baseline: 0 } : {}),
+            inheritedTurnCount: 0,
+            turns: [],
+          };
           const now = yield* nowIso;
           const session: ProviderSession = {
             provider: PROVIDER,
@@ -1281,6 +1324,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             resumeCursor: {
               schemaVersion: GROK_RESUME_VERSION,
               sessionId: started.sessionId,
+              history,
             },
             createdAt: now,
             updatedAt: now,
@@ -1295,7 +1339,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,
-            turns: [],
+            turns: history.turns.map((turn) => ({ id: turn.id, items: [] })),
+            history,
+            pendingHistory: undefined,
+            historySupported,
+            startInput: input,
             lastPlanFingerprint: undefined,
             lastKnownProposedPlanMarkdown: undefined,
             lastKnownProposedPlanTurnId: undefined,
@@ -1571,6 +1619,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             // Bind the turn id before cooperative yields so interruptTurn can
             // settle this prompt even if stop arrives during preparation.
             ctx.activeTurnId = turnId;
+            if (steeringTurnId === undefined) {
+              ctx.history = {
+                ...ctx.history,
+                turns: [...ctx.history.turns, { id: turnId, confirmed: false }],
+              };
+              ctx.pendingHistory = undefined;
+              updateHistoryCursor(ctx);
+            }
             // New turn: do not fall back to a previous turn's plan.md body when
             // exit_plan_mode omits planContent.
             if (steeringTurnId === undefined) {
@@ -1782,16 +1838,43 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               if (liveCtx.interruptedTurnIds.has(prepared.turnId)) {
                 return { _tag: "Skipped" as const, interrupted: true };
               }
+              if (
+                prepared.steeringTurnId === undefined &&
+                liveCtx.historySupported &&
+                liveCtx.backgroundTasks.size === 0
+              ) {
+                const count = yield* readGrokPromptCount(liveCtx.acp, liveCtx.acpSessionId).pipe(
+                  Effect.timeoutOption("2 seconds"),
+                  Effect.orElseSucceed(() => Option.none()),
+                );
+                if (Option.isSome(count)) {
+                  liveCtx.pendingHistory = {
+                    turnId: prepared.turnId,
+                    before: count.value,
+                    unsafe: false,
+                  };
+                  if (
+                    liveCtx.history.baseline === undefined &&
+                    liveCtx.history.turns.length === 1
+                  ) {
+                    liveCtx.history = { ...liveCtx.history, baseline: count.value };
+                    updateHistoryCursor(liveCtx);
+                  }
+                }
+              }
               const dispatched = yield* Deferred.make<void>();
+              const prompt = [
+                ...prepared.promptParts,
+                ...(prepared.runtimeInstructions
+                  ? [{ type: "text" as const, text: prepared.runtimeInstructions }]
+                  : []),
+              ];
               const fiber = yield* liveCtx.acp
                 .prompt(
                   {
-                    prompt: [
-                      ...prepared.promptParts,
-                      ...(prepared.runtimeInstructions
-                        ? [{ type: "text" as const, text: prepared.runtimeInstructions }]
-                        : []),
-                    ],
+                    prompt: liveCtx.historySupported
+                      ? markGrokPrompt(prompt, prepared.turnId)
+                      : prompt,
                   },
                   { dispatched },
                 )
@@ -1932,6 +2015,34 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     resumeCursor: ctx.session.resumeCursor,
                   };
                 }
+                if (
+                  result.stopReason !== "cancelled" &&
+                  ctx.pendingHistory?.turnId === prepared.turnId &&
+                  ctx.backgroundTasks.size === 0
+                ) {
+                  const boundary = yield* sealGrokBoundary(
+                    ctx.acp,
+                    ctx.acpSessionId,
+                    ctx.pendingHistory,
+                  );
+                  if (ctx.interruptedTurnIds.has(prepared.turnId)) {
+                    ctx.pendingHistory = undefined;
+                    yield* Ref.set(promptSettled, true);
+                    return {
+                      threadId: input.threadId,
+                      turnId: prepared.turnId,
+                      resumeCursor: ctx.session.resumeCursor,
+                    };
+                  }
+                  ctx.history = {
+                    ...ctx.history,
+                    turns: ctx.history.turns.map((turn) =>
+                      turn.id === boundary.id ? boundary : turn,
+                    ),
+                  };
+                }
+                ctx.pendingHistory = undefined;
+                updateHistoryCursor(ctx);
                 const completedAt = yield* nowIso;
                 const { activeTurnId: _completedTurnId, ...readySession } = ctx.session;
                 ctx.activeTurnId = undefined;
@@ -2163,22 +2274,119 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         return { threadId, turns: ctx.turns };
       });
 
+    const assertHistoryIdle = (ctx: GrokSessionContext) => {
+      const detail = !ctx.historySupported
+        ? "This Grok CLI did not confirm support for native conversation history."
+        : ctx.promptsInFlight > 0 || ctx.activeTurnId !== undefined || ctx.backgroundTasks.size > 0
+          ? "Wait for this Grok turn and its background work to finish before changing history."
+          : undefined;
+      return detail
+        ? Effect.fail(
+            new ProviderAdapterRequestError({ provider: PROVIDER, method: "grok/history", detail }),
+          )
+        : Effect.void;
+    };
+
     const rollbackThread: GrokAdapterShape["rollbackThread"] = (threadId, numTurns) =>
-      Effect.gen(function* () {
-        yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          if (!Number.isInteger(numTurns) || numTurns < 1) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "numTurns must be an integer >= 1.",
+            });
+          }
+          yield* assertHistoryIdle(ctx);
+          ctx.history = yield* rewindGrokHistory(
+            ctx.acp,
+            ctx.acpSessionId,
+            ctx.history,
+            numTurns,
+          ).pipe(Effect.mapError((cause) => mapAcpHistoryError(threadId, cause)));
+          ctx.turns = ctx.turns.filter((turn) =>
+            ctx.history.turns.some((kept) => kept.id === turn.id),
+          );
+          updateHistoryCursor(ctx);
+          return { threadId, turns: ctx.turns };
+        }),
+      );
+
+    const forkThread: NonNullable<GrokAdapterShape["forkThread"]> = (input) =>
+      withThreadLock(
+        input.sourceThreadId,
+        Effect.gen(function* () {
+          const ctx = sessions.get(input.sourceThreadId);
+          if (ctx) yield* assertHistoryIdle(ctx);
+          if (sessions.has(input.targetThreadId) || input.sourceThreadId === input.targetThreadId)
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "forkThread",
+              issue: "Fork target already exists.",
+            });
+          const sourceInput = ctx
+            ? { ...ctx.startInput, ...input.sourceSessionInput }
+            : input.sourceSessionInput;
+          const sourceCwd = ctx?.session.cwd ?? sourceInput?.cwd;
+          const cwd = input.cwd ?? sourceCwd;
+          const resume = readGrokResume(ctx?.session.resumeCursor ?? sourceInput?.resumeCursor);
+          if (!cwd || !sourceCwd || !sourceInput || !resume?.history)
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "grok/history",
+              detail: "The original Grok working directory or verified history is unavailable.",
+            });
+          const forkInput = {
+            sessionId: resume.sessionId,
+            sourceCwd,
+            cwd,
+            history: ctx?.history ?? resume.history,
+            sourceTurnId: input.sourceTurnId,
+          };
+          const fork = yield* (
+            ctx
+              ? forkGrokHistory(ctx.acp, forkInput)
+              : Effect.gen(function* () {
+                  const runtime = yield* makeGrokAcpRuntime({
+                    grokSettings,
+                    environment: options?.environment ?? process.env,
+                    childProcessSpawner,
+                    cwd,
+                    clientInfo: { name: "t3-code-history", version: "0.0.0" },
+                  });
+                  yield* runtime.initialize();
+                  if (!(yield* probeGrokHistoryExtensions(runtime)))
+                    return yield* new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "grok/history",
+                      detail: "This Grok CLI does not support native history operations.",
+                    });
+                  return yield* forkGrokHistory(runtime, forkInput);
+                }).pipe(Effect.scoped, Effect.provideService(Crypto.Crypto, crypto))
+          ).pipe(Effect.mapError((cause) => mapAcpHistoryError(input.sourceThreadId, cause)));
+          const session = yield* startSession({
+            ...sourceInput,
+            threadId: input.targetThreadId,
+            cwd,
+            resumeCursor: fork,
           });
-        }
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "thread/rollback",
-          detail: "Grok ACP sessions do not support provider-side rollback yet.",
-        });
-      });
+          const child = yield* requireSession(input.targetThreadId);
+          const count = yield* readGrokPromptCount(child.acp, child.acpSessionId).pipe(
+            Effect.mapError((cause) => mapAcpHistoryError(input.targetThreadId, cause)),
+          );
+          if (count !== fork.retainCount) {
+            yield* stopSessionInternal(child);
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "grok/history",
+              detail: "Grok fork did not preserve the requested native history boundary.",
+            });
+          }
+          return session;
+        }),
+      );
 
     const stopSession: GrokAdapterShape["stopSession"] = (threadId) =>
       withThreadLock(
@@ -2216,13 +2424,22 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        get supportsConversationRollback() {
+          return (
+            options?.historySupported?.() === true ||
+            [...sessions.values()].some((ctx) => ctx.historySupported)
+          );
+        },
+      },
       compaction: { type: "slash-command", command: "/compact" },
       startSession,
       sendTurn,
       interruptTurn,
       readThread,
       rollbackThread,
+      forkThread,
       respondToRequest,
       respondToUserInput,
       stopSession,

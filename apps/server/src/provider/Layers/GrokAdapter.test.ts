@@ -37,6 +37,9 @@ import {
 } from "./GrokAdapter.ts";
 
 const decodeGrokSettings = Schema.decodeSync(GrokSettings);
+const decodeNativeHistoryCounts = Schema.decodeSync(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Number)),
+);
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
@@ -233,6 +236,74 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect(
+    "forks and rewinds Grok native history across adapter restart without prompt echoes",
+    () =>
+      Effect.gen(function* () {
+        const tempDir = yield* Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-history-")),
+        );
+        const nativePath = NodePath.join(tempDir, "native.json");
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockGrokWrapper({ T3_ACP_GROK_HISTORY_PATH: nativePath }),
+        );
+        const adapter = yield* makeTestAdapter(wrapperPath);
+        const sourceThreadId = ThreadId.make("native-history-source");
+        yield* adapter.startSession({
+          threadId: sourceThreadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+        const first = yield* adapter.sendTurn({
+          threadId: sourceThreadId,
+          input: "Remember silver square",
+        });
+        yield* adapter.sendTurn({ threadId: sourceThreadId, input: "Later context" });
+        const source = (yield* adapter.listSessions()).find(
+          (session) => session.threadId === sourceThreadId,
+        )!;
+        yield* adapter.stopSession(sourceThreadId);
+        const child = yield* adapter.forkThread!({
+          sourceThreadId,
+          targetThreadId: ThreadId.make("native-history-child"),
+          sourceTurnId: first.turnId,
+          retainedTurnCount: 1,
+          sourceSessionInput: {
+            threadId: sourceThreadId,
+            cwd: process.cwd(),
+            runtimeMode: "full-access",
+            resumeCursor: source.resumeCursor,
+          },
+        });
+        assert.isFalse(yield* adapter.hasSession(sourceThreadId));
+        yield* adapter.sendTurn({ threadId: child.threadId, input: "Child prompt" });
+        const childCursor = (yield* adapter.listSessions()).find(
+          (session) => session.threadId === child.threadId,
+        )!.resumeCursor;
+        yield* adapter.stopSession(child.threadId);
+        yield* adapter.startSession({
+          threadId: child.threadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: childCursor,
+        });
+        const restored = yield* adapter.rollbackThread(child.threadId, 1);
+        assert.deepEqual(
+          restored.turns.map((turn) => turn.id),
+          [first.turnId],
+        );
+        const native = yield* Effect.promise(async () =>
+          decodeNativeHistoryCounts(await NodeFSP.readFile(nativePath, "utf8")),
+        );
+        assert.equal(native["mock-session-1"], 2);
+        assert.equal(native["fork-mock-session-1"], 1);
+        assert.match(
+          (yield* adapter.rollbackThread(child.threadId, 1).pipe(Effect.flip)).message,
+          /inherited/,
+        );
+      }),
+  );
+
   for (const taskType of ["monitor", "shell"] as const) {
     it.effect(`emits the ${taskType} background lifecycle`, () =>
       Effect.gen(function* () {
@@ -412,6 +483,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.deepStrictEqual(session.resumeCursor, {
         schemaVersion: 1,
         sessionId: "mock-session-1",
+        history: { baseline: 0, inheritedTurnCount: 0, turns: [] },
       });
       const resumes = requests.filter((request) => request.method === "session/load");
       assert.equal(resumes.length, 1);
@@ -456,6 +528,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.deepStrictEqual(session.resumeCursor, {
         schemaVersion: 1,
         sessionId: "mock-session-1",
+        history: { baseline: 0, inheritedTurnCount: 0, turns: [] },
       });
 
       yield* adapter.sendTurn({
@@ -2051,6 +2124,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.deepStrictEqual(session.resumeCursor, {
         schemaVersion: 1,
         sessionId: "mock-session-1",
+        history: { inheritedTurnCount: 0, turns: [] },
       });
       assert.isFalse(
         runtimeEvents.some(
