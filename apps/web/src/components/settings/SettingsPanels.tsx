@@ -54,9 +54,11 @@ import {
   canCheckForUpdate,
   getDesktopUpdateButtonTooltip,
   getDesktopUpdateInstallConfirmationMessage,
+  getDesktopUpdateReleaseUrl,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
 } from "../../components/desktopUpdate.logic";
+import { openDesktopUpdateReleaseNotes } from "../desktopUpdate.toast";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { TraitsPicker } from "../chat/TraitsPicker";
 import {
@@ -282,7 +284,9 @@ function AboutVersionSection() {
   const [isUpdateActionPending, setIsUpdateActionPending] = useState(false);
 
   const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.desktopBridge);
-  const selectedUpdateChannel = updateState?.channel ?? "latest";
+  const selectedUpdateChannel = updateState?.notifyOnly
+    ? "latest"
+    : (updateState?.channel ?? "latest");
   const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;
 
   const handleUpdateChannelChange = useCallback(
@@ -290,6 +294,7 @@ function AboutVersionSection() {
       const bridge = window.desktopBridge;
       if (
         !bridge ||
+        updateState?.notifyOnly ||
         typeof bridge.setUpdateChannel !== "function" ||
         channel === selectedUpdateChannel
       ) {
@@ -312,7 +317,7 @@ function AboutVersionSection() {
           setIsChangingUpdateChannel(false);
         });
     },
-    [selectedUpdateChannel],
+    [selectedUpdateChannel, updateState?.notifyOnly],
   );
 
   const handleButtonClick = useCallback(async () => {
@@ -320,6 +325,18 @@ function AboutVersionSection() {
     if (!bridge) return;
 
     const action = updateState ? resolveDesktopUpdateButtonAction(updateState) : "none";
+
+    if (action === "release-notes") {
+      if (isUpdateActionPending) return;
+      const releaseUrl = getDesktopUpdateReleaseUrl(updateState?.availableVersion ?? null);
+      setIsUpdateActionPending(true);
+      try {
+        if (releaseUrl) await openDesktopUpdateReleaseNotes(bridge, releaseUrl);
+      } finally {
+        setIsUpdateActionPending(false);
+      }
+      return;
+    }
 
     if (action === "download") {
       void bridge.downloadUpdate().catch((error: unknown) => {
@@ -407,7 +424,11 @@ function AboutVersionSection() {
       ? !canCheckForUpdate(updateState)
       : isDesktopUpdateButtonDisabled(updateState);
 
-  const actionLabel: Record<string, string> = { download: "Download", install: "Install" };
+  const actionLabel: Record<string, string> = {
+    download: "Download",
+    install: "Install",
+    "release-notes": "View Release Notes",
+  };
   const statusLabel: Record<string, string> = {
     checking: "Checking…",
     downloading: "Downloading…",
@@ -415,8 +436,9 @@ function AboutVersionSection() {
   };
   const buttonLabel =
     actionLabel[action] ?? statusLabel[updateState?.status ?? ""] ?? "Check for Updates";
-  const description =
-    action === "download" || action === "install"
+  const description = updateState?.notifyOnly
+    ? `Custom build based on T3 Code ${updateState.currentVersion}. Stable release notifications only; updates are manual.`
+    : action === "download" || action === "install"
       ? "Update available."
       : "Current version of the application.";
 
@@ -443,7 +465,13 @@ function AboutVersionSection() {
           </Tooltip>
         }
       />
-      {hasDesktopBridge ? (
+      {hasDesktopBridge && updateState?.notifyOnly ? (
+        <SettingsRow
+          title="Upstream releases"
+          description="This custom build never downloads or installs updates automatically."
+          control={<span className="text-sm text-muted-foreground">Stable · Notify only</span>}
+        />
+      ) : hasDesktopBridge ? (
         <SettingsRow
           title="Update track"
           description="Use stable releases or nightly builds. Switch back anytime."

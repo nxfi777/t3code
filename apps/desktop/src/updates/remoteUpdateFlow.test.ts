@@ -34,6 +34,22 @@ function makeState(overrides: Partial<DesktopUpdateState> = {}): DesktopUpdateSt
 }
 
 describe("nextRemoteDesktopUpdateStep", () => {
+  it("refuses notification-only builds even if an available or downloaded version is present", () => {
+    for (const status of ["available", "downloaded"] as const) {
+      const result = nextRemoteDesktopUpdateStep(
+        makeState({
+          notifyOnly: true,
+          status,
+          availableVersion: "1.2.4",
+          downloadedVersion: "1.2.4",
+        }),
+        NO_ATTEMPTS,
+        null,
+      );
+      assert.equal(result.action, "done");
+      assert.propertyVal(result, "outcome", "failed");
+    }
+  });
   it("fails immediately when updates are disabled, preferring the known reason", () => {
     const state = makeState({ enabled: false, status: "disabled" });
     assert.deepEqual(nextRemoteDesktopUpdateStep(state, NO_ATTEMPTS, "dev build"), {

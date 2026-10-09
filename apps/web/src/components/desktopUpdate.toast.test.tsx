@@ -10,7 +10,10 @@ vi.mock("./ui/toast", () => ({
   toastManager: { add: testState.addToast },
 }));
 
-import { showDesktopUpdateDownloadedToast } from "./desktopUpdate.toast";
+import {
+  showDesktopUpdateDownloadedToast,
+  showDesktopUpstreamReleaseToast,
+} from "./desktopUpdate.toast";
 
 type ClickableElement = ReactElement<{ readonly onClick?: () => void }>;
 
@@ -63,6 +66,46 @@ function downloadedState(overrides: Partial<DesktopUpdateState> = {}): DesktopUp
 describe("showDesktopUpdateDownloadedToast", () => {
   beforeEach(() => {
     testState.addToast.mockReset();
+  });
+
+  it("notifies once per upstream release in the UI session and opens its release notes", async () => {
+    const shell = { openExternal: vi.fn().mockResolvedValue(true) };
+    const state = downloadedState({
+      notifyOnly: true,
+      status: "available",
+      availableVersion: "0.0.71",
+      downloadedVersion: null,
+    });
+    showDesktopUpstreamReleaseToast(shell, state);
+    showDesktopUpstreamReleaseToast(shell, { ...state });
+    expect(testState.addToast).toHaveBeenCalledTimes(1);
+    expect(testState.addToast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "T3 Code 0.0.71 is available" }),
+    );
+    findReleaseNotesLink(getDescription())?.props.onClick?.();
+    expect(shell.openExternal).toHaveBeenCalledWith(
+      "https://github.com/pingdotgg/t3code/releases/tag/v0.0.71",
+    );
+    showDesktopUpstreamReleaseToast(shell, { ...state, availableVersion: "0.0.72" });
+    expect(testState.addToast).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not notify for ordinary updates or a checking state", () => {
+    const shell = { openExternal: vi.fn() };
+    showDesktopUpstreamReleaseToast(shell, downloadedState({ status: "available" }));
+    showDesktopUpstreamReleaseToast(
+      shell,
+      downloadedState({ notifyOnly: true, status: "checking" }),
+    );
+    expect(testState.addToast).not.toHaveBeenCalled();
+  });
+
+  it("never offers a restart toast in notify-only mode, even with stale downloaded state", () => {
+    showDesktopUpdateDownloadedToast(
+      { openExternal: vi.fn() },
+      downloadedState({ notifyOnly: true }),
+    );
+    expect(testState.addToast).not.toHaveBeenCalled();
   });
 
   it("opens the downloaded version's release notes", async () => {

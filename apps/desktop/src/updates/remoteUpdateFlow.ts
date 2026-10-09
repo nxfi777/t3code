@@ -45,6 +45,14 @@ export function nextRemoteDesktopUpdateStep(
   attempts: RemoteDesktopUpdateAttempts,
   disabledReason: string | null,
 ): RemoteDesktopUpdateStep {
+  if (state.notifyOnly) {
+    return {
+      action: "done",
+      outcome: "failed",
+      reason:
+        "This personal build only checks for releases. Update it manually to preserve its custom features.",
+    };
+  }
   if (!state.enabled || state.status === "disabled") {
     return {
       action: "done",

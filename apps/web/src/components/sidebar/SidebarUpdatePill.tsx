@@ -14,12 +14,17 @@ import {
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
   getDesktopUpdateInstallConfirmationMessage,
+  getDesktopUpdateReleaseUrl,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldToastDesktopUpdateActionResult,
 } from "../desktopUpdate.logic";
-import { showDesktopUpdateDownloadedToast } from "../desktopUpdate.toast";
+import {
+  openDesktopUpdateReleaseNotes,
+  showDesktopUpdateDownloadedToast,
+  showDesktopUpstreamReleaseToast,
+} from "../desktopUpdate.toast";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Popover, PopoverCreateHandle, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { SidebarMenuItem } from "../ui/sidebar";
@@ -40,7 +45,12 @@ export function shouldUseSidebarUpdateReleaseNotesPopover(
   showUpdateDetails: boolean,
   state: DesktopUpdateState | null,
 ): boolean {
-  return showUpdateDetails && state?.channel === "nightly" && state.releaseNotes.length > 0;
+  return (
+    showUpdateDetails &&
+    !state?.notifyOnly &&
+    state?.channel === "nightly" &&
+    state.releaseNotes.length > 0
+  );
 }
 
 export function handleSidebarUpdateReleaseNotesPopoverOpenChange(
@@ -77,7 +87,7 @@ function resolveSidebarUpdatePresentation({
       ? "downloaded"
       : isDownloading
         ? "downloading"
-        : action === "download"
+        : action === "download" || action === "release-notes"
           ? "available"
           : "idle";
 
@@ -114,6 +124,10 @@ export function SidebarUpdatePill() {
 
 function SidebarUpdateControl() {
   const state = useDesktopUpdateState();
+  useEffect(() => {
+    const bridge = window.desktopBridge;
+    if (bridge && state) showDesktopUpstreamReleaseToast(bridge, state);
+  }, [state]);
   const [isActionPending, setIsActionPending] = useState(false);
   const [checkAnimationKey, setCheckAnimationKey] = useState(0);
   const [isCheckAnimationLatched, setIsCheckAnimationLatched] = useState(false);
@@ -179,6 +193,16 @@ function SidebarUpdateControl() {
     if (isInteractionDisabled) return;
 
     setIsActionPending(true);
+
+    if (action === "release-notes") {
+      const releaseUrl = getDesktopUpdateReleaseUrl(state.availableVersion);
+      try {
+        if (releaseUrl) await openDesktopUpdateReleaseNotes(bridge, releaseUrl);
+      } finally {
+        setIsActionPending(false);
+      }
+      return;
+    }
 
     if (action === "download") {
       void bridge

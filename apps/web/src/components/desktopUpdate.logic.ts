@@ -1,6 +1,6 @@
 import type { DesktopUpdateActionResult, DesktopUpdateState } from "@t3tools/contracts";
 
-export type DesktopUpdateButtonAction = "download" | "install" | "none";
+export type DesktopUpdateButtonAction = "download" | "install" | "release-notes" | "none";
 
 const DESKTOP_RELEASE_HISTORY_URL = "https://github.com/pingdotgg/t3code/releases";
 const DESKTOP_RELEASE_TAG_URL = `${DESKTOP_RELEASE_HISTORY_URL}/tag`;
@@ -28,6 +28,9 @@ export function getDesktopUpdateReleaseHistoryUrl(): string {
 export function resolveDesktopUpdateButtonAction(
   state: DesktopUpdateState,
 ): DesktopUpdateButtonAction {
+  if (state.notifyOnly) {
+    return state.availableVersion && state.status !== "checking" ? "release-notes" : "none";
+  }
   if (
     state.downloadedVersion &&
     (state.status === "downloaded" ||
@@ -52,6 +55,7 @@ export function shouldShowArm64IntelBuildWarning(state: DesktopUpdateState | nul
 }
 
 export function isDesktopUpdateButtonDisabled(state: DesktopUpdateState | null): boolean {
+  if (state?.notifyOnly) return state.status === "checking";
   return state?.status === "downloading";
 }
 
@@ -59,6 +63,8 @@ export function getArm64IntelBuildWarningDescription(state: DesktopUpdateState):
   if (!shouldShowArm64IntelBuildWarning(state)) {
     return "This install is using the correct architecture.";
   }
+  if (state.notifyOnly)
+    return "This Mac has Apple Silicon, but this custom build runs under Rosetta. Rebuild it for Apple Silicon to run natively.";
 
   const action = resolveDesktopUpdateButtonAction(state);
   if (action === "download") {
@@ -71,6 +77,13 @@ export function getArm64IntelBuildWarningDescription(state: DesktopUpdateState):
 }
 
 export function getDesktopUpdateButtonTooltip(state: DesktopUpdateState): string {
+  if (state.notifyOnly) {
+    if (state.status === "checking") return "Checking for upstream releases…";
+    if (state.availableVersion)
+      return `T3 Code ${state.availableVersion} is available. View release notes; update this custom build manually.`;
+    if (state.status === "error") return state.message ?? "Could not check for upstream releases.";
+    return `Custom build based on T3 Code ${state.currentVersion}. Upstream update notifications only.`;
+  }
   if (state.status === "available") {
     return `Update ${state.availableVersion ?? "available"} ready to download`;
   }

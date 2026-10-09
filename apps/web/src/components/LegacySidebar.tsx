@@ -132,12 +132,16 @@ import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
   getDesktopUpdateInstallConfirmationMessage,
+  getDesktopUpdateReleaseUrl,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldToastDesktopUpdateActionResult,
 } from "./desktopUpdate.logic";
-import { showDesktopUpdateDownloadedToast } from "./desktopUpdate.toast";
+import {
+  openDesktopUpdateReleaseNotes,
+  showDesktopUpdateDownloadedToast,
+} from "./desktopUpdate.toast";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -2869,7 +2873,7 @@ function SortableProjectItem({
 interface SidebarProjectsContentProps {
   showArm64IntelBuildWarning: boolean;
   arm64IntelBuildWarningDescription: string | null;
-  desktopUpdateButtonAction: "download" | "install" | "none";
+  desktopUpdateButtonAction: ReturnType<typeof resolveDesktopUpdateButtonAction>;
   desktopUpdateButtonDisabled: boolean;
   desktopUpdateActionPending: boolean;
   handleDesktopUpdateButtonClick: () => void;
@@ -3002,7 +3006,9 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 >
                   {desktopUpdateButtonAction === "download"
                     ? "Download ARM build"
-                    : "Install ARM build"}
+                    : desktopUpdateButtonAction === "release-notes"
+                      ? "View release notes"
+                      : "Install ARM build"}
                 </Button>
               </AlertAction>
             ) : null}
@@ -3658,6 +3664,16 @@ export default function LegacySidebar() {
     }
 
     setDesktopUpdateActionPending(true);
+
+    if (desktopUpdateButtonAction === "release-notes") {
+      const releaseUrl = getDesktopUpdateReleaseUrl(desktopUpdateState.availableVersion);
+      try {
+        if (releaseUrl) await openDesktopUpdateReleaseNotes(bridge, releaseUrl);
+      } finally {
+        setDesktopUpdateActionPending(false);
+      }
+      return;
+    }
 
     if (desktopUpdateButtonAction === "download") {
       void bridge

@@ -24,9 +24,11 @@ export async function openDesktopUpdateReleaseNotes(
 function ReleaseNotesLink({
   shell,
   releaseUrl,
+  label = "Read more",
 }: {
   shell: DesktopUpdateShell;
   releaseUrl: string;
+  label?: string;
 }) {
   return (
     <button
@@ -36,7 +38,7 @@ function ReleaseNotesLink({
       }}
       type="button"
     >
-      Read more
+      {label}
       <ArrowRightIcon
         aria-hidden
         className="ml-1 inline size-3 -rotate-45 align-[-0.125em]"
@@ -46,10 +48,40 @@ function ReleaseNotesLink({
   );
 }
 
+const notifiedUpstreamVersions = new Set<string>();
+
+export function showDesktopUpstreamReleaseToast(
+  shell: DesktopUpdateShell,
+  state: DesktopUpdateState,
+): void {
+  const version = state.availableVersion;
+  if (
+    !state.notifyOnly ||
+    state.status !== "available" ||
+    !version ||
+    notifiedUpstreamVersions.has(version)
+  )
+    return;
+  const releaseUrl = getDesktopUpdateReleaseUrl(version);
+  if (!releaseUrl) return;
+  notifiedUpstreamVersions.add(version);
+  toastManager.add({
+    type: "info",
+    title: `T3 Code ${version} is available`,
+    description: (
+      <>
+        Update this custom build manually to keep your changes.
+        <ReleaseNotesLink shell={shell} releaseUrl={releaseUrl} label="View release notes" />
+      </>
+    ),
+  });
+}
+
 export function showDesktopUpdateDownloadedToast(
   shell: DesktopUpdateShell,
   state: DesktopUpdateState,
 ): void {
+  if (state.notifyOnly) return;
   const releaseUrl = getDesktopUpdateReleaseUrl(getDesktopUpdateDownloadedVersion(state));
   toastManager.add({
     type: "success",

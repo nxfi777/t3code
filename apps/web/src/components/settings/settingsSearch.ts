@@ -475,6 +475,16 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["generated thread titles source control content default provider"],
   },
   {
+    id: "app-updates",
+    title: "App updates",
+    to: "/settings/general",
+    targetId: "about",
+    searchTerms: [
+      "version check upstream releases release notes notify notification notifications manual custom build stable latest",
+    ],
+    desktopOnly: true,
+  },
+  {
     id: "diagnostics",
     title: "Diagnostics",
     to: "/settings/general",
