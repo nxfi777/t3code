@@ -86,6 +86,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly linuxWmClass: string;
     readonly linuxApplicationsDir: string;
     readonly appImagePath: Option.Option<string>;
+    readonly desktopUserDataPathOverride: Option.Option<string>;
     readonly defaultDesktopSettings: DesktopAppSettings.DesktopSettings;
     readonly runtimeInfo: DesktopRuntimeInfo;
     readonly resolvePickFolderDefaultPath: (rawOptions: unknown) => Option.Option<string>;
@@ -179,7 +180,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     isDevelopment,
     appVersion: input.appVersion,
   });
-  const displayName = branding.displayName;
+  const displayName = Option.getOrElse(config.desktopAppNameOverride, () => branding.displayName);
   const stateDir = resolveDesktopStateDir({
     baseDir,
     isDevelopment,
@@ -242,6 +243,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
     linuxApplicationsDir,
     appImagePath: config.appImagePath,
+    desktopUserDataPathOverride: config.desktopUserDataPathOverride,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),
     runtimeInfo: resolveDesktopRuntimeInfo({
       platform: input.platform,
