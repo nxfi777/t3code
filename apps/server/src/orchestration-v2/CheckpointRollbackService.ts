@@ -137,7 +137,8 @@ export const layer: Layer.Layer<
         checkpoint === undefined ||
         scope === undefined ||
         checkpoint.scopeId !== scope.id ||
-        checkpoint.status !== "ready"
+        checkpoint.status === "stale" ||
+        (input.restoreFiles !== false && checkpoint.status !== "ready")
       ) {
         return yield* new CheckpointRollbackExecutionError({
           reason: "rollback-target-invalid",
@@ -271,10 +272,15 @@ export const layer: Layer.Layer<
           candidate.scopeId === scope.id &&
           candidate.appRunOrdinal !== null &&
           candidate.appRunOrdinal > targetOrdinal &&
-          candidate.status === "ready",
+          candidate.status !== "stale",
       );
-      if (staleCheckpoints.length > 0) {
-        yield* checkpoints.deleteStaleRefs({ scope, checkpoints: staleCheckpoints });
+      // Missing and failed snapshots still identify discarded conversation
+      // boundaries. Only ready checkpoints have Git refs to delete.
+      const staleFileCheckpoints = staleCheckpoints.filter(
+        (candidate) => candidate.status === "ready",
+      );
+      if (staleFileCheckpoints.length > 0) {
+        yield* checkpoints.deleteStaleRefs({ scope, checkpoints: staleFileCheckpoints });
       }
 
       // Thread commands write full provider thread rows under this lock. Without

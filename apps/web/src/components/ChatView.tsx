@@ -8388,6 +8388,16 @@ export default function ChatView(props: ChatViewProps) {
     setPendingRevert(null);
   }
 
+  const pendingRevertCheckpoint = pendingRevert
+    ? serverProjection?.checkpoints.findLast((checkpoint) =>
+        pendingRevert.turnCount === 0
+          ? checkpoint.ordinalWithinScope === 0 && checkpoint.appRunOrdinal === null
+          : checkpoint.appRunOrdinal === pendingRevert.turnCount,
+      )
+    : undefined;
+  const canRestorePendingRevertFiles =
+    activeThread?.worktreePath != null && pendingRevertCheckpoint?.status === "ready";
+
   const onRevertToTurnCount = useCallback(
     async (turnCount: number, messageId: MessageId, restoreFiles?: boolean) => {
       const localApi = readLocalApi();
@@ -12044,16 +12054,18 @@ export default function ChatView(props: ChatViewProps) {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
-            <Button
-              variant="destructive"
-              onClick={() => {
-                if (!pendingRevert || pendingRevert.routeThreadKey !== routeThreadKey) return;
-                setPendingRevert(null);
-                void onRevertToTurnCount(pendingRevert.turnCount, pendingRevert.messageId, true);
-              }}
-            >
-              Revert files too
-            </Button>
+            {canRestorePendingRevertFiles ? (
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  if (!pendingRevert || pendingRevert.routeThreadKey !== routeThreadKey) return;
+                  setPendingRevert(null);
+                  void onRevertToTurnCount(pendingRevert.turnCount, pendingRevert.messageId, true);
+                }}
+              >
+                Revert files too
+              </Button>
+            ) : null}
             <Button
               onClick={() => {
                 if (!pendingRevert || pendingRevert.routeThreadKey !== routeThreadKey) return;

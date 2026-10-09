@@ -833,6 +833,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
             [],
           );
           assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
+
+          const conversationCommandId = CommandId.make(`runtime-rewind-${status}`);
+          const conversationOnly = orchestrator.dispatch({
+            type: "checkpoint.rollback",
+            commandId: conversationCommandId,
+            threadId,
+            checkpointId,
+            scopeId: scope.id,
+            restoreFiles: false,
+          });
+          if (status === "stale") {
+            yield* conversationOnly.pipe(Effect.flip);
+            assert.deepEqual(yield* outbox.listByCommandId(conversationCommandId), []);
+          } else {
+            const reply = yield* conversationOnly;
+            assert.deepEqual(
+              reply.storedEvents.map((stored) => stored.event.type),
+              ["thread.metadata-updated", "checkpoint.rollback-requested"],
+            );
+          }
         }
       }
     }).pipe(Effect.provide(Layer.fresh(layerTest))),
