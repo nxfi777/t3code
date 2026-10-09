@@ -233,6 +233,10 @@ export interface AcpAdapterV2NativeHistory {
     readonly notification: EffectAcpSchema.SessionNotification;
     readonly requestId?: string;
   }) => OrchestrationV2ProviderTurn["nativeTurnRef"];
+  readonly beginTurnReference: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+    sessionId: string,
+  ) => Effect.Effect<OrchestrationV2ProviderTurn["nativeTurnRef"]>;
   readonly finalizeTurnReference: (
     runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
     current: OrchestrationV2ProviderTurn["nativeTurnRef"],
@@ -7260,6 +7264,26 @@ export function makeAcpAdapterV2(
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
+            if (
+              nativeHistorySupported &&
+              flavor.nativeHistory !== undefined &&
+              !(yield* sessionRuntime.hasPendingBackgroundWork ?? Effect.succeed(false))
+            ) {
+              context.historyTurnRef = yield* flavor.nativeHistory.beginTurnReference(
+                runtime,
+                requestedSessionId,
+              );
+              const providerTurn = providerTurnPayload(context, "running", null);
+              yield* Ref.update(providerTurns, (current) =>
+                new Map(current).set(String(providerTurn.id), providerTurn),
+              );
+              yield* emitProviderEvent({
+                type: "provider_turn.updated",
+                driver,
+                threadId: context.input.threadId,
+                providerTurn,
+              });
+            }
             yield* runtime
               .prompt({
                 prompt:

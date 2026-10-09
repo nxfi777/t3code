@@ -147,6 +147,33 @@ describe("Grok native history capability", () => {
 });
 
 describe("Grok prompt boundaries", () => {
+  it.effect(
+    "seals a serialized prompt without echoes only for one verified native advancement",
+    () =>
+      Effect.gen(function* () {
+        const pending = yield* grokNativeHistory.beginTurnReference(
+          runtime({ promptCount: 5 }).runtime,
+          "native-source",
+        );
+        assert.equal(pending?.strength, "weak");
+        const completed = yield* grokNativeHistory.finalizeTurnReference(
+          runtime({ promptCount: 6 }).runtime,
+          pending,
+        );
+        assert.equal(completed?.strength, "strong");
+        assert.include(completed!.nativeId!, '"first":5,"last":5');
+        // No advancement (e.g. a rejected prompt), a rewind, and additional
+        // provider-authored turns cannot identify this request unambiguously.
+        for (const promptCount of [4, 5, 7]) {
+          const ambiguous = yield* grokNativeHistory.finalizeTurnReference(
+            runtime({ promptCount }).runtime,
+            pending,
+          );
+          assert.equal(ambiguous?.strength, "weak");
+          assert.equal(ambiguous?.nativeId, "grok-history-unmapped");
+        }
+      }),
+  );
   it.effect("persists an unsealed echo and only seals a matching native head", () =>
     Effect.gen(function* () {
       const captured = grokNativeHistory.captureTurnReference({
