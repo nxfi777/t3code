@@ -2124,7 +2124,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
-          occurredAt: command.createdAt,
+          // Historical checkpoint repairs must not make an existing client
+          // move this thread backwards after a concurrent update. Dispatch
+          // holds the command lock, so this timestamp is authoritative.
+          occurredAt:
+            compareDateTimeStrings(thread.updatedAt, command.createdAt) > 0
+              ? thread.updatedAt
+              : command.createdAt,
           commandId: command.commandId,
         })),
         type: "thread.turn-diff-completed",

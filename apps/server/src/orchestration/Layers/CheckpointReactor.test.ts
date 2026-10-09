@@ -68,6 +68,7 @@ import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
 import { PullRequestService } from "../../pullRequest/PullRequestService.ts";
+import { ServerActivation } from "../../serverActivation.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
@@ -293,6 +294,7 @@ describe("CheckpointReactor", () => {
   });
 
   async function createHarness(options?: {
+    readonly startReactor?: boolean;
     readonly checkpointLookupFailure?: (
       cwd: string,
     ) => VcsProcessTimeoutError | VcsProcessSpawnError | undefined;
@@ -422,7 +424,7 @@ describe("CheckpointReactor", () => {
         yield* Stream.runForEach(receiptBus.streamEventsForTest, (receipt) =>
           Queue.offer(receipts, receipt),
         ).pipe(Effect.forkIn(testScope, { startImmediately: true }));
-        yield* reactor.start().pipe(Scope.provide(testScope));
+        if (options?.startReactor !== false) yield* reactor.start().pipe(Scope.provide(testScope));
         return receipts;
       }),
     );
@@ -516,6 +518,12 @@ describe("CheckpointReactor", () => {
       provider,
       cwd,
       drain,
+      startReactor: (activation?: Effect.Effect<void>) =>
+        Effect.runPromise(
+          reactor
+            .start()
+            .pipe(Scope.provide(testScope), Effect.provideService(ServerActivation, activation)),
+        ),
       nextReceipt: Queue.take(receipts),
       pullRequestRefreshes,
     };
@@ -1171,6 +1179,321 @@ describe("CheckpointReactor", () => {
           ]);
         }
       }),
+  );
+
+  const seedLegacyConversation = (
+    engine: OrchestrationEngineShape,
+    count: number,
+    options?: { readonly ambiguous?: boolean; readonly incomplete?: boolean },
+  ) =>
+    Effect.gen(function* () {
+      for (let index = 1; index <= count; index++) {
+        const createdAt = `2026-01-01T00:00:0${options?.ambiguous ? 1 : index}.000Z`;
+        const completedAt = createdAt.replace(".000Z", ".900Z");
+        yield* engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make(`startup-legacy-running-${index}`),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: asTurnId(`persisted-turn-${index}`),
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+        yield* engine.dispatch({
+          type: "thread.message.assistant.delta",
+          commandId: CommandId.make(`startup-legacy-delta-${index}`),
+          threadId: ThreadId.make("thread-1"),
+          turnId: asTurnId(`persisted-turn-${index}`),
+          messageId: MessageId.make(`persisted-response-${index}`),
+          delta: `Persisted response ${index}`,
+          createdAt,
+        });
+        if (!(options?.incomplete && index === count)) {
+          yield* engine.dispatch({
+            type: "thread.message.assistant.complete",
+            commandId: CommandId.make(`startup-legacy-complete-${index}`),
+            threadId: ThreadId.make("thread-1"),
+            turnId: asTurnId(`persisted-turn-${index}`),
+            messageId: MessageId.make(`persisted-response-${index}`),
+            createdAt: completedAt,
+          });
+          yield* engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`startup-legacy-ready-${index}`),
+            threadId: ThreadId.make("thread-1"),
+            session: {
+              threadId: ThreadId.make("thread-1"),
+              status: "ready",
+              providerName: "codex",
+              runtimeMode: "approval-required",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: completedAt,
+            },
+            createdAt: completedAt,
+          });
+        }
+      }
+    });
+
+  effectIt.effect.each(["single", "now-git"] as const)(
+    "repairs persisted conversation boundaries at startup without a new turn: %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            startReactor: false,
+            initializeGit: scenario === "now-git",
+            seedFilesystemCheckpoints: false,
+          }),
+        );
+        const count = scenario === "single" ? 1 : 3;
+        yield* seedLegacyConversation(harness.engine, count);
+        const before = yield* Effect.promise(harness.readModel);
+        yield* Effect.promise(() => harness.startReactor());
+        yield* Effect.promise(harness.drain);
+        const after = yield* Effect.promise(harness.readModel);
+        expect(after.threads[0]!.messages).toEqual(before.threads[0]!.messages);
+        expect(before.threads[0]!.latestTurn?.turnId).toBe(`persisted-turn-${count}`);
+        expect(after.threads[0]!.latestTurn).toEqual(before.threads[0]!.latestTurn);
+        expect(after.threads[0]!.updatedAt).toBe(before.threads[0]!.updatedAt);
+        expect(after.threads[0]!.checkpoints).toHaveLength(count);
+        for (let index = 1; index <= count; index++)
+          expect(after.threads[0]!.checkpoints[index - 1]).toMatchObject({
+            turnId: `persisted-turn-${index}`,
+            assistantMessageId: `persisted-response-${index}`,
+            checkpointTurnCount: index,
+            checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), index),
+            completedAt: `2026-01-01T00:00:0${index}.900Z`,
+            status: "missing",
+            files: [],
+          });
+        expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+        // Repeating startup produces no events and leaves original message
+        // timestamps and checkpoint refs intact.
+        yield* Effect.promise(() => harness.startReactor());
+        yield* Effect.promise(harness.drain);
+        expect(yield* Effect.promise(harness.readModel)).toEqual(after);
+      }),
+  );
+
+  effectIt.effect("waits for server activation before repairing persisted boundaries", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startReactor: false,
+          initializeGit: false,
+          seedFilesystemCheckpoints: false,
+        }),
+      );
+      yield* seedLegacyConversation(harness.engine, 1);
+      const before = yield* Effect.promise(harness.readModel);
+      const activation = yield* Deferred.make<void>();
+      yield* Effect.promise(() => harness.startReactor(Deferred.await(activation)));
+      expect(yield* Effect.promise(harness.readModel)).toEqual(before);
+      yield* Deferred.succeed(activation, undefined);
+      yield* Effect.promise(harness.drain);
+      expect((yield* Effect.promise(harness.readModel)).threads[0]!.checkpoints).toHaveLength(1);
+    }),
+  );
+
+  effectIt.effect.each([
+    "archived",
+    "starting",
+    "running",
+    "active-id",
+    "pending",
+    "incomplete",
+    "ambiguous",
+    "ready",
+    "error",
+  ] as const)("leaves unsafe legacy history untouched at startup: %s", (reason) =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startReactor: false,
+          initializeGit: false,
+          seedFilesystemCheckpoints: false,
+        }),
+      );
+      const threadId = ThreadId.make("thread-1");
+      yield* seedLegacyConversation(harness.engine, 2, {
+        ambiguous: reason === "ambiguous",
+        incomplete: reason === "incomplete",
+      });
+      const createdAt = "2026-01-01T00:00:04.000Z";
+      if (reason === "archived")
+        yield* harness.engine.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("startup-archive"),
+          threadId,
+        });
+      if (reason === "starting" || reason === "running" || reason === "active-id")
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("startup-busy-session"),
+          threadId,
+          session: {
+            threadId,
+            status: reason === "active-id" ? "ready" : reason,
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: reason === "active-id" ? asTurnId("live-turn") : null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+      if (reason === "pending")
+        yield* harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("startup-pending"),
+          threadId,
+          message: {
+            messageId: MessageId.make("pending-user"),
+            role: "user",
+            text: "Pending",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt,
+        });
+      if (reason === "ready" || reason === "error")
+        yield* harness.engine.dispatch({
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("startup-real-checkpoint"),
+          threadId,
+          turnId: asTurnId("persisted-turn-2"),
+          assistantMessageId: MessageId.make("persisted-response-2"),
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.make("refs/t3/preserved/real-checkpoint"),
+          status: reason,
+          files: [],
+          completedAt: "2026-01-01T00:00:02.000Z",
+          createdAt,
+        });
+      const before = yield* Effect.promise(harness.readModel);
+      yield* Effect.promise(() => harness.startReactor());
+      yield* Effect.promise(harness.drain);
+      expect(yield* Effect.promise(harness.readModel)).toEqual(before);
+      expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect("preserves correctly indexed real checkpoints while repairing later gaps", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startReactor: false,
+          initializeGit: false,
+          seedFilesystemCheckpoints: false,
+        }),
+      );
+      yield* seedLegacyConversation(harness.engine, 3);
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("startup-preserve-ref"),
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("persisted-turn-1"),
+        assistantMessageId: MessageId.make("persisted-response-1"),
+        checkpointTurnCount: 1,
+        checkpointRef: CheckpointRef.make("refs/t3/preserved/original"),
+        status: "ready",
+        files: [{ path: "README.md", kind: "modified", additions: 1, deletions: 0 }],
+        completedAt: "2026-01-01T00:00:01.000Z",
+        createdAt: "2026-01-01T00:00:04.000Z",
+      });
+      const before = (yield* Effect.promise(harness.readModel)).threads[0]!;
+      yield* Effect.promise(() => harness.startReactor());
+      yield* Effect.promise(harness.drain);
+      const after = (yield* Effect.promise(harness.readModel)).threads[0]!;
+      expect(after.messages).toEqual(before.messages);
+      expect(after.latestTurn).toEqual(before.latestTurn);
+      expect(after.updatedAt).toBe(before.updatedAt);
+      expect(after.checkpoints).toHaveLength(3);
+      expect(after.checkpoints[0]).toEqual(before.checkpoints[0]);
+    }),
+  );
+
+  effectIt.effect("stops startup repair when a new turn is queued between repair commands", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          startReactor: false,
+          initializeGit: false,
+          seedFilesystemCheckpoints: false,
+        }),
+      );
+      yield* seedLegacyConversation(harness.engine, 3);
+      const before = (yield* Effect.promise(harness.readModel)).threads[0]!;
+      const dispatch = harness.engine.dispatch;
+      let started = false;
+      vi.spyOn(harness.engine, "dispatch").mockImplementation((command, options) => {
+        if (started || command.type !== "thread.turn.diff.complete")
+          return dispatch(command, options);
+        started = true;
+        // A newer lifecycle event wins the command queue after the reactor's
+        // guard read but before its historical checkpoint command is decided.
+        return dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("startup-racing-session-update"),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:04.000Z",
+          },
+          createdAt: "2026-01-01T00:00:04.000Z",
+        }).pipe(
+          Effect.andThen(dispatch(command, options)),
+          Effect.tap(() =>
+            dispatch({
+              type: "thread.turn.start",
+              commandId: CommandId.make("startup-racing-turn"),
+              threadId: ThreadId.make("thread-1"),
+              message: {
+                messageId: MessageId.make("racing-user"),
+                role: "user",
+                text: "New work",
+                attachments: [],
+              },
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "approval-required",
+              createdAt: "2026-01-01T00:00:05.000Z",
+            }),
+          ),
+        );
+      });
+      yield* Effect.promise(() => harness.startReactor());
+      yield* Effect.promise(harness.drain);
+      const after = (yield* Effect.promise(harness.readModel)).threads[0]!;
+      expect(started).toBe(true);
+      expect(after.checkpoints).toHaveLength(1);
+      expect(after.checkpoints[0]).toMatchObject({
+        turnId: "persisted-turn-3",
+        checkpointTurnCount: 3,
+      });
+      expect(after.messages.filter((message) => message.role === "assistant")).toHaveLength(3);
+      expect(after.messages.at(-1)?.text).toBe("New work");
+      expect(after.latestTurn).toEqual(before.latestTurn);
+      expect(after.updatedAt).toBe("2026-01-01T00:00:05.000Z");
+      const events = Array.from(yield* Stream.runCollect(harness.engine.readEvents(0)));
+      const repairEvent = events.find((event) =>
+        event.commandId?.startsWith("server:conversation-history-backfill:"),
+      );
+      expect(repairEvent?.occurredAt).toBe("2026-01-01T00:00:04.000Z");
+    }),
   );
 
   effectIt.effect.each(["turn.completed", "turn.aborted"] as const)(

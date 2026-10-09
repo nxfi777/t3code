@@ -7,17 +7,20 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  type OrchestrationThreadShell,
   type ProviderRuntimeEvent,
   type VcsStatusLocalResult,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
@@ -32,7 +35,7 @@ import {
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
-import { forkParked } from "../../serverActivation.ts";
+import { forkParked, ServerActivation } from "../../serverActivation.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
@@ -42,11 +45,16 @@ import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
-import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import {
+  ProjectionTurnRepository,
+  ProjectionTurn,
+} from "../../persistence/Services/ProjectionTurns.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+const conversationTurnEquals = Schema.toEquivalence(ProjectionTurn);
 
 type ReactorInput =
+  | { readonly source: "startup" }
   | {
       readonly source: "runtime";
       readonly event: ProviderRuntimeEvent;
@@ -78,6 +86,56 @@ function checkpointStatusFromRuntime(status: string | undefined): "ready" | "mis
     default:
       return "ready";
   }
+}
+
+function orderedConversationTurns(turns: ReadonlyArray<ProjectionTurn>) {
+  return turns.toSorted(
+    (left, right) =>
+      compareDateTimeStrings(left.requestedAt, right.requestedAt) ||
+      compareDateTimeStrings(
+        left.startedAt ?? left.requestedAt,
+        right.startedAt ?? right.requestedAt,
+      ) ||
+      (left.checkpointTurnCount !== null && right.checkpointTurnCount !== null
+        ? left.checkpointTurnCount - right.checkpointTurnCount
+        : 0),
+  );
+}
+
+function hasAmbiguousConversationTurns(
+  turns: ReadonlyArray<ProjectionTurn>,
+  currentTurn?: ProjectionTurn,
+) {
+  return turns.some((turn, index) => {
+    const previous = turns[index - 1];
+    return (
+      turn.turnId === null ||
+      turn.state === "pending" ||
+      turn.state === "running" ||
+      turn.completedAt === null ||
+      (currentTurn !== undefined &&
+        compareDateTimeStrings(turn.requestedAt, currentTurn.requestedAt) > 0) ||
+      (turn.checkpointTurnCount !== index + 1 &&
+        turn.checkpointStatus !== null &&
+        turn.checkpointStatus !== "missing") ||
+      (previous !== undefined &&
+        compareDateTimeStrings(previous.requestedAt, turn.requestedAt) === 0 &&
+        compareDateTimeStrings(
+          previous.startedAt ?? previous.requestedAt,
+          turn.startedAt ?? turn.requestedAt,
+        ) === 0 &&
+        (previous.checkpointTurnCount === null || turn.checkpointTurnCount === null))
+    );
+  });
+}
+
+function isConversationBusy(thread: Pick<OrchestrationThreadShell, "session" | "latestTurn">) {
+  return (
+    thread.session?.status === "starting" ||
+    thread.session?.status === "running" ||
+    thread.session?.activeTurnId != null ||
+    thread.latestTurn?.state === "running"
+  );
 }
 
 const make = Effect.gen(function* () {
@@ -241,6 +299,121 @@ const make = Effect.gen(function* () {
       return undefined;
     }
     return cwd;
+  });
+
+  const repairConversationTurns = Effect.fn("repairConversationTurns")(function* (
+    threadId: ThreadId,
+    turns: ReadonlyArray<ProjectionTurn>,
+    createdAt: string,
+    assistantMessageIds?: ReadonlyMap<TurnId, MessageId>,
+    startupGuard?: { readonly archivedAt: string | null },
+  ) {
+    // Move later missing entries first so a unique-count conflict cannot clear
+    // a boundary that has already been repaired. Real checkpoints are rejected
+    // by hasAmbiguousConversationTurns before any command is dispatched.
+    for (let index = turns.length - 1; index >= 0; index--) {
+      const turn = turns[index]!;
+      if (turn.turnId === null || turn.checkpointTurnCount === index + 1) continue;
+      if (startupGuard) {
+        const shell = yield* projectionSnapshotQuery.getThreadShellById(threadId);
+        if (
+          Option.isNone(shell) ||
+          shell.value.archivedAt !== startupGuard.archivedAt ||
+          isConversationBusy(shell.value)
+        )
+          return;
+        const freshTurns = orderedConversationTurns(
+          yield* projectionTurns.listByThreadId({ threadId }),
+        );
+        if (
+          freshTurns.length !== turns.length ||
+          freshTurns.some(
+            (entry, turnIndex) =>
+              entry.turnId !== turns[turnIndex]!.turnId ||
+              entry.state !== turns[turnIndex]!.state ||
+              entry.completedAt !== turns[turnIndex]!.completedAt ||
+              entry.requestedAt !== turns[turnIndex]!.requestedAt ||
+              entry.startedAt !== turns[turnIndex]!.startedAt,
+          ) ||
+          !conversationTurnEquals(freshTurns[index]!, turn)
+        )
+          return;
+      }
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: yield* serverCommandId("conversation-history-backfill"),
+        threadId,
+        turnId: turn.turnId,
+        completedAt: turn.completedAt!,
+        checkpointRef: checkpointRefForThreadTurn(threadId, index + 1),
+        status: turn.state === "error" ? "error" : "missing",
+        files: turn.checkpointFiles,
+        assistantMessageId:
+          assistantMessageIds?.get(turn.turnId) ??
+          turn.assistantMessageId ??
+          MessageId.make(`assistant:${turn.turnId}`),
+        checkpointTurnCount: index + 1,
+        createdAt,
+      });
+    }
+  });
+
+  const repairLegacyConversations = Effect.fn("repairLegacyConversations")(function* () {
+    // Shells and turn rows are cheap; hydrate messages only for a history that
+    // actually needs repair. Process one thread at a time on shared machines.
+    const snapshot = yield* projectionSnapshotQuery.getShellSnapshot();
+    for (const shell of snapshot.threads) {
+      if (isConversationBusy(shell)) continue;
+      yield* Effect.gen(function* () {
+        const turns = orderedConversationTurns(
+          yield* projectionTurns.listByThreadId({ threadId: shell.id }),
+        );
+        if (
+          !turns.some((turn, index) => turn.checkpointTurnCount !== index + 1) ||
+          hasAmbiguousConversationTurns(turns)
+        )
+          return;
+        // Only conversation metadata is repaired. This also covers a workspace
+        // that became a Git repository after its historical turns completed.
+        const thread = yield* resolveThreadDetail(shell.id);
+        if (!thread || isConversationBusy(thread)) return;
+        const assistantMessageIds = new Map<TurnId, MessageId>();
+        const messagesById = new Map(thread.messages.map((message) => [message.id, message]));
+        for (const message of thread.messages) {
+          if (message.role === "assistant" && message.turnId !== null && !message.streaming)
+            assistantMessageIds.set(message.turnId, message.id);
+        }
+        // Never manufacture a message or native turn boundary for imported or
+        // incomplete history. An association must point to a real response.
+        for (const turn of turns) {
+          if (turn.turnId === null || !assistantMessageIds.has(turn.turnId)) return;
+          if (turn.assistantMessageId !== null) {
+            const message = messagesById.get(turn.assistantMessageId);
+            if (
+              !message ||
+              message.role !== "assistant" ||
+              message.turnId !== turn.turnId ||
+              message.streaming
+            )
+              return;
+            assistantMessageIds.set(turn.turnId, turn.assistantMessageId);
+          }
+        }
+        // The guard rechecks lifecycle and pending rows before each command in
+        // case a startup client starts work while its workspace is inspected.
+        yield* repairConversationTurns(shell.id, turns, shell.updatedAt, assistantMessageIds, {
+          archivedAt: shell.archivedAt,
+        });
+      }).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          () =>
+            Effect.logWarning("failed to repair legacy conversation boundaries", {
+              threadId: shell.id,
+            }),
+        ),
+      );
+    }
   });
 
   // Capture the completed turn's files, then publish its summary and receipts.
@@ -450,19 +623,9 @@ const make = Effect.gen(function* () {
           return;
         const turns = yield* projectionTurns.listByThreadId({ threadId: thread.id });
         const currentTurn = turns.find((turn) => turn.turnId === turnId);
-        const previousTurns = turns
-          .filter((turn) => turn.turnId !== null && turn.turnId !== turnId)
-          .toSorted(
-            (left, right) =>
-              compareDateTimeStrings(left.requestedAt, right.requestedAt) ||
-              compareDateTimeStrings(
-                left.startedAt ?? left.requestedAt,
-                right.startedAt ?? right.requestedAt,
-              ) ||
-              (left.checkpointTurnCount !== null && right.checkpointTurnCount !== null
-                ? left.checkpointTurnCount - right.checkpointTurnCount
-                : 0),
-          );
+        const previousTurns = orderedConversationTurns(
+          turns.filter((turn) => turn.turnId !== null && turn.turnId !== turnId),
+        );
         const needsRepair = previousTurns.some(
           (turn, index) => turn.checkpointTurnCount !== index + 1,
         );
@@ -470,26 +633,7 @@ const make = Effect.gen(function* () {
           // Old non-Git turns had no checkpoints. Backfill their actual persisted
           // turn IDs before exposing a new boundary, otherwise revert(0) would
           // discard the old UI transcript while retaining it in the provider.
-          const ambiguous = previousTurns.some((turn, index) => {
-            const previous = previousTurns[index - 1];
-            return (
-              turn.state === "pending" ||
-              turn.state === "running" ||
-              turn.completedAt === null ||
-              (currentTurn !== undefined &&
-                compareDateTimeStrings(turn.requestedAt, currentTurn.requestedAt) > 0) ||
-              (turn.checkpointTurnCount !== index + 1 &&
-                turn.checkpointStatus !== null &&
-                turn.checkpointStatus !== "missing") ||
-              (previous !== undefined &&
-                compareDateTimeStrings(previous.requestedAt, turn.requestedAt) === 0 &&
-                compareDateTimeStrings(
-                  previous.startedAt ?? previous.requestedAt,
-                  turn.startedAt ?? turn.requestedAt,
-                ) === 0 &&
-                (previous.checkpointTurnCount === null || turn.checkpointTurnCount === null))
-            );
-          });
+          const ambiguous = hasAmbiguousConversationTurns(previousTurns, currentTurn);
           if (ambiguous) {
             yield* appendCaptureFailureActivity({
               threadId: thread.id,
@@ -500,26 +644,7 @@ const make = Effect.gen(function* () {
             });
             return;
           }
-          // Move later missing entries first so the projection's unique count
-          // constraint does not clear a boundary that has already been repaired.
-          for (let index = previousTurns.length - 1; index >= 0; index--) {
-            const turn = previousTurns[index]!;
-            if (turn.turnId === null || turn.checkpointTurnCount === index + 1) continue;
-            yield* orchestrationEngine.dispatch({
-              type: "thread.turn.diff.complete",
-              commandId: yield* serverCommandId("conversation-history-backfill"),
-              threadId: thread.id,
-              turnId: turn.turnId,
-              completedAt: turn.completedAt!,
-              checkpointRef: checkpointRefForThreadTurn(thread.id, index + 1),
-              status: turn.state === "error" ? "error" : "missing",
-              files: turn.checkpointFiles,
-              assistantMessageId:
-                turn.assistantMessageId ?? MessageId.make(`assistant:${turn.turnId}`),
-              checkpointTurnCount: index + 1,
-              createdAt: event.createdAt,
-            });
-          }
+          yield* repairConversationTurns(thread.id, previousTurns, event.createdAt);
         }
         nextTurnCount = previousTurns.length + 1;
         // Conversation history exists without Git. A canonical missing ref marks
@@ -1171,8 +1296,19 @@ const make = Effect.gen(function* () {
     void,
     CheckpointStoreError | OrchestrationDispatchError | PlatformError.PlatformError,
     never
-  > =>
-    input.source === "domain" ? processDomainEvent(input.event) : processRuntimeEvent(input.event);
+  > => {
+    if (input.source === "startup") {
+      return repairLegacyConversations().pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          () => Effect.logWarning("failed to scan legacy conversation boundaries"),
+        ),
+      );
+    }
+    return input.source === "domain"
+      ? processDomainEvent(input.event)
+      : processRuntimeEvent(input.event);
+  };
 
   const processInputSafely = (input: ReactorInput) =>
     processInput(input).pipe(
@@ -1181,15 +1317,23 @@ const make = Effect.gen(function* () {
         (cause) =>
           Effect.logWarning("checkpoint reactor failed to process input", {
             source: input.source,
-            eventType: input.event.type,
+            eventType: input.source === "startup" ? "startup" : input.event.type,
             cause: Cause.pretty(cause),
           }),
       ),
     );
 
   const worker = yield* makeDrainableWorker(processInputSafely);
+  const startupQueued = yield* Deferred.make<void>();
 
   const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {
+    // Use the same queue as turn completion so it cannot assign a new index
+    // halfway through legacy repair. A standby server must never repair data.
+    const enqueueStartup = worker
+      .enqueue({ source: "startup" })
+      .pipe(Effect.andThen(Deferred.succeed(startupQueued, undefined)));
+    if ((yield* ServerActivation) === undefined) yield* enqueueStartup;
+    else yield* forkParked(enqueueStartup);
     yield* forkParked(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (
@@ -1220,7 +1364,8 @@ const make = Effect.gen(function* () {
 
   return {
     start,
-    drain: worker.drain.pipe(
+    drain: Deferred.await(startupQueued).pipe(
+      Effect.andThen(worker.drain),
       Effect.andThen(statusRefreshWorker.drain),
       Effect.andThen(entryRefreshWorker.drain),
     ),

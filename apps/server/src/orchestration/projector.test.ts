@@ -4,6 +4,8 @@ import {
   ProjectId,
   ProviderDriverKind,
   ThreadId,
+  TurnId,
+  MessageId,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -556,6 +558,78 @@ describe("orchestration projector", () => {
             : "completed",
         );
       }),
+  );
+
+  effectIt.effect("keeps the latest turn and recency when replaying a historical checkpoint", () =>
+    Effect.gen(function* () {
+      const threadId = "thread-historical-checkpoint";
+      const recentAt = "2026-09-04T23:00:10.000Z";
+      const event = (
+        sequence: number,
+        type: OrchestrationEvent["type"],
+        payload: unknown,
+        occurredAt: string,
+      ) =>
+        makeEvent({
+          sequence,
+          type,
+          payload,
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          commandId: `historical-${sequence}`,
+          occurredAt,
+        });
+      let model = yield* projectEvent(
+        createEmptyReadModel(recentAt),
+        event(
+          1,
+          "thread.created",
+          {
+            threadId,
+            projectId: "project-1",
+            title: "Historical checkpoint",
+            modelSelection: { instanceId: "codex", model: "test" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: recentAt,
+            updatedAt: recentAt,
+          },
+          recentAt,
+        ),
+      );
+      const latestTurn = {
+        turnId: TurnId.make("latest-turn"),
+        state: "interrupted" as const,
+        requestedAt: "2026-09-04T23:00:05.000Z",
+        startedAt: "2026-09-04T23:00:06.000Z",
+        completedAt: recentAt,
+        assistantMessageId: MessageId.make("latest-response"),
+      };
+      model = { ...model, threads: model.threads.map((thread) => ({ ...thread, latestTurn })) };
+      const after = yield* projectEvent(
+        model,
+        event(
+          2,
+          "thread.turn-diff-completed",
+          {
+            threadId,
+            turnId: "historical-turn",
+            checkpointTurnCount: 1,
+            checkpointRef: "refs/t3/checkpoints/historical/turn/1",
+            status: "missing",
+            files: [],
+            assistantMessageId: "historical-response",
+            completedAt: "2026-09-04T23:00:02.000Z",
+          },
+          "2026-09-04T23:00:03.000Z",
+        ),
+      );
+      expect(after.threads[0]?.latestTurn).toEqual(latestTurn);
+      expect(after.threads[0]?.updatedAt).toBe(recentAt);
+      expect(after.threads[0]?.checkpoints).toHaveLength(1);
+    }),
   );
 
   it("updates canonical thread runtime mode from thread.runtime-mode-set", async () => {

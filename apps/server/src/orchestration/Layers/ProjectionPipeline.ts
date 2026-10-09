@@ -1080,8 +1080,13 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           }
           yield* projectionThreadRepository.upsert({
             ...existingRow.value,
-            latestTurnId: event.payload.turnId,
-            updatedAt: event.occurredAt,
+            // Historical checkpoint repair must not select an older turn as
+            // current. Match the client reducer: only fill an absent pointer.
+            latestTurnId: existingRow.value.latestTurnId ?? event.payload.turnId,
+            updatedAt:
+              compareDateTimeStrings(existingRow.value.updatedAt, event.occurredAt) > 0
+                ? existingRow.value.updatedAt
+                : event.occurredAt,
           });
           yield* refreshThreadShellSummary(event.payload.threadId);
           return;
