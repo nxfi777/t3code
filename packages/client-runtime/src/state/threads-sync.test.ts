@@ -1,6 +1,8 @@
 import {
   EnvironmentId,
+  CheckpointRef,
   EventId,
+  MessageId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
@@ -138,6 +140,7 @@ function awaitThreadState(
 const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (options?: {
   readonly cached?: OrchestrationThread;
   readonly httpSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
+  readonly snapshotLoad?: Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>>;
   readonly completionMarker?: boolean;
   readonly resumeCache?: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]>;
   readonly loadCached?: Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>>;
@@ -199,10 +202,13 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const snapshotLoader = ThreadSnapshotLoader.of({
     load: (_prepared, threadId) =>
       Ref.update(loaderCalls, (count) => count + 1).pipe(
-        Effect.as(
-          threadId === THREAD_ID
-            ? (options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>())
-            : Option.none<OrchestrationThreadDetailSnapshot>(),
+        Effect.andThen(
+          options?.snapshotLoad ??
+            Effect.succeed(
+              threadId === THREAD_ID
+                ? (options?.httpSnapshot ?? Option.none<OrchestrationThreadDetailSnapshot>())
+                : Option.none<OrchestrationThreadDetailSnapshot>(),
+            ),
         ),
       ),
   });
@@ -373,6 +379,122 @@ const deleted = (): OrchestrationThreadStreamItem => ({
 });
 
 describe("EnvironmentThreads", () => {
+  it.effect.each(["exact", "ambiguous", "imported", "retry-none", "retry-stale"] as const)(
+    "resolves completed primary prompts without reload or blocking live events: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const turnId = TurnId.make("silent-turn");
+        const user = {
+          id: MessageId.make(mode === "imported" ? "import:fork:old:0" : "silent-user"),
+          role: "user" as const,
+          text: "Inspect alerts",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-04-01T00:00:00.000Z",
+          updatedAt: "2026-04-01T00:00:00.000Z",
+        };
+        const cached: OrchestrationThread = {
+          ...BASE_THREAD,
+          messages: [user],
+          latestTurn: {
+            turnId,
+            state: "interrupted",
+            requestedAt: "2026-04-01T00:00:03.000Z",
+            startedAt: "2026-04-01T00:00:03.000Z",
+            completedAt: "2026-04-01T00:00:05.000Z",
+            assistantMessageId: null,
+          },
+          session: { ...BASE_THREAD.session!, status: "stopped", activeTurnId: null },
+        };
+        const started = yield* Deferred.make<void>();
+        const response = yield* Deferred.make<Option.Option<OrchestrationThreadDetailSnapshot>>();
+        const retries = mode === "retry-none" || mode === "retry-stale";
+        const resolves = mode === "exact" || retries;
+        let attempts = 0;
+        const harness = yield* makeHarness({
+          cached,
+          snapshotLoad: Effect.gen(function* () {
+            attempts += 1;
+            yield* Deferred.succeed(started, undefined);
+            if (retries && attempts === 1)
+              return mode === "retry-none"
+                ? Option.none()
+                : Option.some({
+                    snapshotSequence: 7,
+                    thread: { ...cached, messages: [{ ...user, turnId }] },
+                  });
+            return yield* Deferred.await(response);
+          }),
+        });
+        yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+        const checkpoint: Extract<OrchestrationThreadStreamItem, { kind: "event" }> = {
+          kind: "event",
+          event: {
+            eventId: EventId.make("silent-checkpoint"),
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            sequence: 8,
+            occurredAt: "2026-04-01T00:00:05.000Z",
+            aggregateKind: "thread",
+            aggregateId: THREAD_ID,
+            type: "thread.turn-diff-completed",
+            payload: {
+              threadId: THREAD_ID,
+              turnId,
+              checkpointTurnCount: 1,
+              checkpointRef: CheckpointRef.make("ref-silent"),
+              status: "missing",
+              files: [],
+              assistantMessageId: MessageId.make("assistant:silent-turn"),
+              completedAt: "2026-04-01T00:00:05.000Z",
+            },
+          },
+        };
+        yield* Queue.offer(harness.inputs, checkpoint);
+        if (mode !== "imported") yield* Deferred.await(started);
+        // HTTP remains parked while newer live events are processed.
+        yield* Queue.offer(harness.inputs, titleUpdated("New live title", 9));
+        const beforeRetry = yield* awaitThreadState(
+          harness.observed,
+          (value) => Option.isSome(value.data) && value.data.value.title === "New live title",
+        );
+        if (retries) {
+          expect(Option.getOrThrow(beforeRetry.data).messages[0]?.turnId).toBeNull();
+          yield* Queue.offer(harness.inputs, {
+            ...checkpoint,
+            event: { ...checkpoint.event, sequence: 10, eventId: EventId.make("retry-checkpoint") },
+          });
+        }
+        yield* Deferred.succeed(
+          response,
+          Option.some({
+            snapshotSequence: 100,
+            thread: {
+              ...cached,
+              title: "Do not copy snapshot content",
+              messages: [{ ...user, turnId: resolves ? turnId : null }],
+            },
+          }),
+        );
+        if (resolves)
+          yield* awaitThreadState(
+            harness.observed,
+            (value) => Option.isSome(value.data) && value.data.value.messages[0]?.turnId === turnId,
+          );
+        yield* Queue.offer(harness.inputs, titleUpdated("Cursor preserved", 11));
+        const final = yield* awaitThreadState(
+          harness.observed,
+          (value) => Option.isSome(value.data) && value.data.value.title === "Cursor preserved",
+        );
+        expect(Option.getOrThrow(final.data).messages[0]).toEqual({
+          ...user,
+          turnId: resolves ? turnId : null,
+        });
+        expect(yield* Ref.get(harness.loaderCalls)).toBe(mode === "imported" ? 0 : retries ? 2 : 1);
+      }),
+  );
   for (const source of ["disk", "HTTP"] as const) {
     it.effect(`does not rewrite an unchanged ${source} snapshot on navigation or warm return`, () =>
       Effect.gen(function* () {

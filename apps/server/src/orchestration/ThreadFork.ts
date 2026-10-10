@@ -55,18 +55,18 @@ export const make = Effect.gen(function* () {
       if (Option.isSome(yield* snapshots.getThreadDetailById(input.targetThreadId))) {
         return yield* new ThreadForkError({ detail: "The fork destination already exists." });
       }
-      const boundary = thread.checkpoints.find(
-        (checkpoint) => checkpoint.assistantMessageId === input.messageId,
-      );
-      const end = thread.messages.findIndex(
-        (message) =>
-          message.id === input.messageId && message.role === "assistant" && !message.streaming,
-      );
-      if (!boundary || end < 0)
+      const selectedIndex = thread.messages.findIndex((message) => message.id === input.messageId);
+      const selectedMessage = thread.messages[selectedIndex];
+      if (
+        !selectedMessage ||
+        selectedMessage.streaming ||
+        (selectedMessage.role !== "assistant" && selectedMessage.role !== "user")
+      )
         return yield* new ThreadForkError({
-          detail: "Choose a completed response with a saved conversation boundary.",
+          detail: "Choose a message from a finished turn with a saved conversation boundary.",
         });
-      const turns = (yield* projectionTurns.listByThreadId({ threadId: thread.id }))
+      const persistedTurns = yield* projectionTurns.listByThreadId({ threadId: thread.id });
+      const turns = persistedTurns
         .filter((turn) => turn.turnId !== null)
         .toSorted(
           (left, right) =>
@@ -77,23 +77,80 @@ export const make = Effect.gen(function* () {
             ) ||
             (left.checkpointTurnCount ?? 0) - (right.checkpointTurnCount ?? 0),
         );
+      const userMessages = thread.messages.filter((message) => message.role === "user");
+      const turnForUserMessage = (message: (typeof userMessages)[number]) => {
+        const byMessageId = turns.filter((turn) => turn.pendingMessageId === message.id);
+        if (byMessageId.length > 0) return byMessageId.length === 1 ? byMessageId[0] : undefined;
+        // Older projections did not retain pendingMessageId. Only an exact,
+        // unique request timestamp is safe; a nearby message may be steering
+        // or a queued prompt belonging to a later native turn.
+        if (userMessages.filter((entry) => entry.createdAt === message.createdAt).length !== 1)
+          return undefined;
+        const byRequestedAt = turns.filter(
+          (turn) => turn.pendingMessageId === null && turn.requestedAt === message.createdAt,
+        );
+        return byRequestedAt.length === 1 ? byRequestedAt[0] : undefined;
+      };
+      const selectedUserTurn =
+        selectedMessage.role === "user" ? turnForUserMessage(selectedMessage) : undefined;
+      const boundary = thread.checkpoints.find((checkpoint) =>
+        selectedMessage.role === "user"
+          ? checkpoint.turnId === selectedUserTurn?.turnId
+          : checkpoint.assistantMessageId === selectedMessage.id,
+      );
+      if (
+        !boundary ||
+        (selectedMessage.role === "user" &&
+          selectedMessage.turnId !== null &&
+          selectedMessage.turnId !== selectedUserTurn?.turnId)
+      )
+        return yield* new ThreadForkError({
+          detail:
+            "The exact finished turn for this message is unavailable. Choose a response with a saved conversation boundary.",
+        });
       if (
         turns.find((turn) => turn.turnId === boundary.turnId)?.checkpointTurnCount !==
           boundary.checkpointTurnCount ||
+        persistedTurns.some((turn) => turn.turnId === null) ||
         turns.some(
           (turn, index) =>
             turn.checkpointTurnCount !== index + 1 ||
             turn.state === "running" ||
-            turn.state === "pending",
+            turn.state === "pending" ||
+            turn.completedAt === null,
         )
       )
         return yield* new ThreadForkError({
           detail:
             "Conversation history has unindexed or ambiguous turns. Complete a new turn to repair its boundaries before forking.",
         });
+      // A user-row fork means AFTER its whole finished turn, including any
+      // replies. A stopped turn can have only reasoning and no assistant text.
+      const end =
+        selectedMessage.role === "user"
+          ? thread.messages.reduce(
+              (last, message, index) =>
+                message.turnId === boundary.turnId ? Math.max(last, index) : last,
+              selectedIndex,
+            )
+          : selectedIndex;
+      const laterTurnIds = new Set(
+        turns.slice(boundary.checkpointTurnCount).map((turn) => turn.turnId),
+      );
+      const laterUserMessageIds = new Set(
+        userMessages.flatMap((message) => {
+          const turn = turnForUserMessage(message);
+          return turn && laterTurnIds.has(turn.turnId) ? [message.id] : [];
+        }),
+      );
       const messages = thread.messages
         .slice(0, end + 1)
-        .filter((message) => message.role === "user" || message.role === "assistant");
+        .filter(
+          (message) =>
+            (message.role === "user" || message.role === "assistant") &&
+            !laterTurnIds.has(message.turnId) &&
+            !laterUserMessageIds.has(message.id),
+        );
       const createdAt = DateTime.formatIso(yield* DateTime.now);
       const commandId = (step: string) => CommandId.make(`fork:${input.targetThreadId}:${step}`);
       let created = false;

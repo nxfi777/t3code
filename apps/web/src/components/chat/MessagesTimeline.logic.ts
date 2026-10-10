@@ -331,7 +331,8 @@ export interface TimelineDurationMessage {
 export type TimelineLatestTurn = Pick<
   OrchestrationLatestTurn,
   "turnId" | "state" | "startedAt" | "completedAt"
->;
+> &
+  Partial<Pick<OrchestrationLatestTurn, "requestedAt">>;
 
 const LIVE_ACTIVITY_ROW_ID = "live-activity-row";
 
@@ -920,14 +921,31 @@ function attachTrailingToolGroupsToAssistant(
   return result;
 }
 
-/** Match each user message to the next assistant checkpoint. */
+/** Match user messages to saved turns, including interrupted turns without a reply. */
 function buildRevertTurnCountByUserMessageId(input: {
   supportsConversationRollback: boolean;
   timelineEntries: ReadonlyArray<TimelineEntry>;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  turnDiffSummaryByTurnId: ReadonlyMap<TurnId, TurnDiffSummary>;
+  latestTurn?: TimelineLatestTurn | null;
   inferredCheckpointTurnCountByTurnId: Readonly<Record<string, number | undefined>>;
 }): Map<MessageId, number> {
   const byUserMessageId = new Map<MessageId, number>();
+  const userCountByCreatedAt = new Map<string, number>();
+  const userCountByTurnId = new Map<TurnId, number>();
+  for (const entry of input.timelineEntries) {
+    if (entry.kind === "message" && entry.message.role === "user") {
+      userCountByCreatedAt.set(
+        entry.message.createdAt,
+        (userCountByCreatedAt.get(entry.message.createdAt) ?? 0) + 1,
+      );
+      if (entry.message.turnId)
+        userCountByTurnId.set(
+          entry.message.turnId,
+          (userCountByTurnId.get(entry.message.turnId) ?? 0) + 1,
+        );
+    }
+  }
   const entryCount = input.supportsConversationRollback ? input.timelineEntries.length : 0;
   for (let index = 0; index < entryCount; index += 1) {
     const entry = input.timelineEntries[index];
@@ -935,25 +953,71 @@ function buildRevertTurnCountByUserMessageId(input: {
       continue;
     }
 
-    for (let nextIndex = index + 1; nextIndex < input.timelineEntries.length; nextIndex += 1) {
+    const hasExactTurnAssociation = (turnId: TurnId) => {
+      if (entry.message.turnId)
+        return entry.message.turnId === turnId && userCountByTurnId.get(turnId) === 1;
+      const latest = input.latestTurn;
+      if (latest?.turnId === turnId && latest.requestedAt !== undefined)
+        return (
+          latest.requestedAt === entry.message.createdAt &&
+          userCountByCreatedAt.get(entry.message.createdAt) === 1
+        );
+      return false;
+    };
+    let summary =
+      entry.message.turnId && hasExactTurnAssociation(entry.message.turnId)
+        ? input.turnDiffSummaryByTurnId.get(entry.message.turnId)
+        : undefined;
+    for (
+      let nextIndex = index + 1;
+      !summary && nextIndex < input.timelineEntries.length;
+      nextIndex += 1
+    ) {
       const nextEntry = input.timelineEntries[nextIndex];
-      if (!nextEntry || nextEntry.kind !== "message") {
+      if (!nextEntry || nextEntry.kind === "proposed-plan") {
         continue;
       }
-      if (nextEntry.message.role === "user") {
+      if (nextEntry.kind === "message" && nextEntry.message.role === "user") {
         break;
       }
-      const summary = input.turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id);
-      if (!summary) {
-        continue;
+      summary =
+        nextEntry.kind === "message"
+          ? input.turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id)
+          : undefined;
+      if (summary) {
+        if (
+          input.latestTurn?.turnId === summary.turnId &&
+          input.latestTurn.requestedAt !== undefined &&
+          !hasExactTurnAssociation(summary.turnId)
+        )
+          summary = undefined;
+        break;
       }
+      const turnId =
+        nextEntry.kind === "message" ? nextEntry.message.turnId : nextEntry.entry.turnId;
+      if (turnId) {
+        const candidate = input.turnDiffSummaryByTurnId.get(turnId);
+        // Steering/queued prompts can precede activity from a different turn.
+        // Activity alone is not an association to the prompt that began it.
+        if (candidate && hasExactTurnAssociation(turnId)) summary = candidate;
+      }
+    }
+    if (!summary) {
+      const latest = input.latestTurn;
+      if (
+        latest &&
+        latest.state !== "running" &&
+        latest.completedAt !== null &&
+        latest.requestedAt === entry.message.createdAt &&
+        hasExactTurnAssociation(latest.turnId)
+      )
+        summary = input.turnDiffSummaryByTurnId.get(latest.turnId);
+    }
+    if (summary) {
       const turnCount =
         summary.checkpointTurnCount ?? input.inferredCheckpointTurnCountByTurnId[summary.turnId];
-      if (typeof turnCount !== "number") {
-        break;
-      }
-      byUserMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
-      break;
+      if (typeof turnCount === "number" && turnCount >= 1)
+        byUserMessageId.set(entry.message.id, turnCount - 1);
     }
   }
   return byUserMessageId;
@@ -977,7 +1041,9 @@ export function deriveMessagesTimelineRows(input: {
   queuedMessages?: ReadonlyArray<QueuedComposerMessage>;
 }): MessagesTimelineRow[] {
   const turnDiffSummaryByAssistantMessageId = new Map<MessageId, TurnDiffSummary>();
+  const turnDiffSummaryByTurnId = new Map<TurnId, TurnDiffSummary>();
   for (const summary of input.turnDiffSummaries) {
+    turnDiffSummaryByTurnId.set(summary.turnId, summary);
     if (summary.assistantMessageId) {
       turnDiffSummaryByAssistantMessageId.set(summary.assistantMessageId, summary);
     }
@@ -986,6 +1052,8 @@ export function deriveMessagesTimelineRows(input: {
     supportsConversationRollback: input.supportsConversationRollback,
     timelineEntries: input.timelineEntries,
     turnDiffSummaryByAssistantMessageId,
+    turnDiffSummaryByTurnId,
+    latestTurn: input.latestTurn ?? null,
     inferredCheckpointTurnCountByTurnId: input.supportsConversationRollback
       ? inferCheckpointTurnCountByTurnId(input.turnDiffSummaries)
       : {},

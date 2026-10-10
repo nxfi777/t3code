@@ -41,6 +41,7 @@ import {
   deriveTimelineEntriesWithState,
   type WorkLogEntry,
   type TimelineEntriesProjection,
+  type TimelineEntry,
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
 
@@ -1666,6 +1667,234 @@ describe("deriveMessagesTimelineRows", () => {
     expect(userRow?.revertTurnCount).toBe(1);
     expect(assistantRow?.assistantTurnDiffSummary).toBe(assistantTurnDiffSummary);
   });
+
+  it.each(["reasoning", "work", "no-output", "older-no-output", "authoritative-latest"] as const)(
+    "allows editing an interrupted turn with %s and no assistant reply",
+    (output) => {
+      const requestedAt = "2026-10-10T09:00:12.676Z";
+      const completedAt = "2026-10-10T09:00:24.409Z";
+      const turnId = TurnId.make("stopped-turn");
+      const timelineEntries: TimelineEntry[] = [
+        {
+          id: "stopped-user",
+          kind: "message",
+          createdAt: requestedAt,
+          message: {
+            id: MessageId.make("stopped-user"),
+            role: "user",
+            text: "Inspect the alerts",
+            turnId:
+              output === "older-no-output" || output === "authoritative-latest" ? turnId : null,
+            streaming: false,
+            createdAt: requestedAt,
+            updatedAt: requestedAt,
+          },
+        },
+      ];
+      if (output === "reasoning")
+        timelineEntries.push({
+          id: "thought",
+          kind: "message",
+          createdAt: completedAt,
+          message: {
+            id: MessageId.make("thought"),
+            role: "reasoning",
+            text: "Inspecting",
+            turnId,
+            streaming: false,
+            createdAt: completedAt,
+            updatedAt: completedAt,
+          },
+        });
+      if (output === "work")
+        timelineEntries.push({
+          id: "work",
+          kind: "work",
+          createdAt: completedAt,
+          entry: {
+            id: "work",
+            turnId,
+            createdAt: completedAt,
+            label: "Inspecting",
+            tone: "thinking",
+          },
+        });
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries,
+        isWorking: false,
+        activeTurnStartedAt: null,
+        supportsConversationRollback: true,
+        latestTurn: {
+          turnId: output === "older-no-output" ? TurnId.make("newer-turn") : turnId,
+          state: "interrupted",
+          requestedAt: output === "authoritative-latest" ? completedAt : requestedAt,
+          startedAt: requestedAt,
+          completedAt,
+        },
+        turnDiffSummaries: [
+          {
+            turnId,
+            completedAt,
+            assistantMessageId: MessageId.make("assistant:stopped-turn"),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/stopped/1"),
+            status: "missing",
+            files: [],
+          },
+        ],
+      });
+      expect(
+        rows.find((row) => row.kind === "message" && row.message.role === "user"),
+      ).toMatchObject({ revertTurnCount: 0 });
+      expect(rows.some((row) => row.kind === "message" && row.message.role === "assistant")).toBe(
+        false,
+      );
+    },
+  );
+
+  it.each([
+    "different-request",
+    "duplicate-users",
+    "conflicting-turn",
+    "running",
+    "no-checkpoint",
+  ] as const)("does not guess a silent-turn edit boundary for %s", (reason) => {
+    const requestedAt = "2026-10-10T09:00:12.676Z";
+    const completedAt = "2026-10-10T09:00:24.409Z";
+    const turnId = TurnId.make("stopped-turn");
+    const timelineEntries: TimelineEntry[] = [0, ...(reason === "duplicate-users" ? [1] : [])].map(
+      (index) => ({
+        id: `user-${index}`,
+        kind: "message",
+        createdAt: requestedAt,
+        message: {
+          id: MessageId.make(`user-${index}`),
+          role: "user",
+          text: "Inspect",
+          turnId: reason === "conflicting-turn" ? TurnId.make("other-turn") : null,
+          streaming: false,
+          createdAt: requestedAt,
+          updatedAt: requestedAt,
+        },
+      }),
+    );
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: reason === "running",
+      activeTurnStartedAt: null,
+      supportsConversationRollback: true,
+      latestTurn: {
+        turnId,
+        state: reason === "running" ? "running" : "interrupted",
+        requestedAt: reason === "different-request" ? completedAt : requestedAt,
+        startedAt: requestedAt,
+        completedAt,
+      },
+      turnDiffSummaries:
+        reason === "no-checkpoint"
+          ? []
+          : [
+              {
+                turnId,
+                completedAt,
+                assistantMessageId: MessageId.make("assistant:stopped-turn"),
+                checkpointTurnCount: 1,
+                checkpointRef: CheckpointRef.make("refs/t3/checkpoints/stopped/1"),
+                status: "missing",
+                files: [],
+              },
+            ],
+    });
+    expect(
+      rows
+        .filter((row) => row.kind === "message" && row.message.role === "user")
+        .every((row) => row.kind === "message" && row.revertTurnCount === undefined),
+    ).toBe(true);
+  });
+
+  it.each(["reasoning", "work", "assistant"] as const)(
+    "does not attach earlier-turn %s to a queued or steering prompt",
+    (output) => {
+      const requestedAt = "2026-10-10T09:00:12.676Z";
+      const queuedAt = "2026-10-10T09:00:15.000Z";
+      const completedAt = "2026-10-10T09:00:24.409Z";
+      const turnId = TurnId.make("earlier-turn");
+      const timelineEntries: TimelineEntry[] = [requestedAt, queuedAt].map((createdAt, index) => ({
+        id: `user-${index}`,
+        kind: "message",
+        createdAt,
+        message: {
+          id: MessageId.make(`user-${index}`),
+          role: "user",
+          text: "Inspect",
+          turnId: null,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }));
+      if (output === "work")
+        timelineEntries.push({
+          id: "output",
+          kind: "work",
+          createdAt: completedAt,
+          entry: {
+            id: "output",
+            turnId,
+            createdAt: completedAt,
+            label: "Inspecting",
+            tone: "tool",
+          },
+        });
+      else
+        timelineEntries.push({
+          id: "output",
+          kind: "message",
+          createdAt: completedAt,
+          message: {
+            id: MessageId.make("output"),
+            role: output,
+            text: "Earlier turn output",
+            turnId,
+            streaming: false,
+            createdAt: completedAt,
+            updatedAt: completedAt,
+          },
+        });
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries,
+        isWorking: false,
+        activeTurnStartedAt: null,
+        supportsConversationRollback: true,
+        latestTurn: {
+          turnId,
+          state: "interrupted",
+          requestedAt,
+          startedAt: requestedAt,
+          completedAt,
+        },
+        turnDiffSummaries: [
+          {
+            turnId,
+            completedAt,
+            assistantMessageId: MessageId.make(
+              output === "assistant" ? "output" : "assistant:earlier-turn",
+            ),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/earlier/1"),
+            status: "missing",
+            files: [],
+          },
+        ],
+      });
+      expect(
+        rows.find((row) => row.kind === "message" && row.message.id === "user-0"),
+      ).toMatchObject({ revertTurnCount: 0 });
+      expect(
+        rows.find((row) => row.kind === "message" && row.message.id === "user-1"),
+      ).toMatchObject({ revertTurnCount: undefined });
+    },
+  );
 
   it("folds the first assistant message and settled work before the terminal response", () => {
     const timelineEntries = [

@@ -1,5 +1,6 @@
 import {
   ORCHESTRATION_WS_METHODS,
+  isImportedAgentSessionMessageId,
   type EnvironmentId as EnvironmentIdType,
   type OrchestrationThread,
   type OrchestrationThreadDetailPage,
@@ -186,6 +187,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   threadId: ThreadIdType,
   resumeCache?: ThreadResumeCache,
 ) {
+  const threadScope = yield* Effect.scope;
   const supervisor = yield* EnvironmentSupervisor;
   const cache = yield* EnvironmentCacheStore;
   const snapshotLoader = yield* ThreadSnapshotLoader;
@@ -436,6 +438,91 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     );
   });
 
+  const primaryAssociationRequests = new Set<string>();
+  const refreshMissingPrimaryAssociation = Effect.fnUntraced(function* (
+    thread: OrchestrationThread,
+    item: Extract<OrchestrationThreadStreamItem, { kind: "event" }>,
+  ) {
+    const turnId =
+      item.event.type === "thread.turn-diff-completed"
+        ? item.event.payload.turnId
+        : item.event.type === "thread.session-set" &&
+            item.event.payload.session.status !== "running" &&
+            item.event.payload.session.status !== "starting"
+          ? thread.latestTurn?.turnId
+          : undefined;
+    if (
+      !turnId ||
+      primaryAssociationRequests.has(turnId) ||
+      thread.session?.activeTurnId === turnId ||
+      !thread.checkpoints.some((checkpoint) => checkpoint.turnId === turnId) ||
+      thread.messages.some((message) => message.role === "user" && message.turnId === turnId) ||
+      !thread.messages.some(
+        (message) =>
+          message.role === "user" &&
+          message.turnId === null &&
+          !isImportedAgentSessionMessageId(message.id),
+      )
+    )
+      return;
+    const prepared = yield* SubscriptionRef.get(supervisor.prepared);
+    if (Option.isNone(prepared)) return;
+    primaryAssociationRequests.add(turnId);
+    if (primaryAssociationRequests.size > 200)
+      primaryAssociationRequests.delete(primaryAssociationRequests.values().next().value!);
+    const epoch = yield* Ref.get(historyEpoch);
+    const supportsPagination = yield* Ref.get(paginationSupported);
+    const supportsReasoning = yield* Ref.get(reasoningMessagesSupported);
+    // Session events do not carry pendingMessageId, and their timestamps need
+    // not equal the prompt's. Fetch the authoritative join once at completion.
+    // Merge only this association: keep loaded pages, content and event cursor,
+    // and never block the live event stream on an HTTP request.
+    yield* snapshotLoader
+      .load(
+        prepared.value,
+        threadId,
+        supportsPagination ? { turnLimit: INITIAL_THREAD_USER_TURN_LIMIT } : undefined,
+        supportsReasoning,
+      )
+      .pipe(
+        Effect.flatMap((snapshot) =>
+          applyLock.withPermits(1)(
+            Effect.gen(function* () {
+              if (
+                Option.isNone(snapshot) ||
+                snapshot.value.snapshotSequence < item.event.sequence ||
+                (yield* Ref.get(historyEpoch)) !== epoch
+              ) {
+                // The loader logs HTTP failures and returns None. An absent
+                // or obsolete response must not suppress a later retry.
+                primaryAssociationRequests.delete(turnId);
+                return;
+              }
+              const users = snapshot.value.thread.messages.filter(
+                (message) =>
+                  message.role === "user" &&
+                  message.turnId === turnId &&
+                  !isImportedAgentSessionMessageId(message.id),
+              );
+              if (users.length !== 1) return;
+              const primary = users[0]!;
+              const current = yield* SubscriptionRef.get(state);
+              if (Option.isNone(current.data)) return;
+              let changed = false;
+              const messages = current.data.value.messages.map((message) => {
+                if (message.id !== primary.id || message.role !== "user" || message.turnId !== null)
+                  return message;
+                changed = true;
+                return { ...message, turnId };
+              });
+              if (changed) yield* setThread({ ...current.data.value, messages }, "keep");
+            }),
+          ),
+        ),
+        Effect.forkIn(threadScope),
+      );
+  });
+
   // Body of applyItem, running under applyLock.
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (
     item: OrchestrationThreadStreamItem,
@@ -489,6 +576,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     const result = applyThreadDetailEvent(current.data.value, item.event);
     if (result.kind === "updated") {
       yield* setThread(result.thread, "keep");
+      yield* refreshMissingPrimaryAssociation(result.thread, item);
     } else if (result.kind === "deleted") {
       yield* setDeleted();
     }

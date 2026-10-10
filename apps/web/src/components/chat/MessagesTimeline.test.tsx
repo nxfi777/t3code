@@ -157,14 +157,18 @@ function stubDomGlobals() {
   };
 
   vi.stubGlobal("Element", ElementStub);
-  vi.stubGlobal("localStorage", {
+  const localStorage = {
     getItem: () => null,
     setItem: () => {},
     removeItem: () => {},
     clear: () => {},
-  });
+  };
+  vi.stubGlobal("localStorage", localStorage);
+  vi.stubGlobal("requestAnimationFrame", () => 0);
+  vi.stubGlobal("cancelAnimationFrame", () => {});
   vi.stubGlobal("window", {
     Element: ElementStub,
+    localStorage,
     matchMedia,
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -285,6 +289,81 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it.each([false, true])(
+    "shows stopped user-turn Edit and Fork controls, busy=%s",
+    async (busy) => {
+      const user = buildUserTimelineEntry("Inspect the alerts");
+      const turnId = TurnId.make("stopped-turn");
+      const onRevertToTurnCount = vi.fn();
+      const onForkMessage = vi.fn();
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline
+              {...buildProps()}
+              timelineEntries={[user]}
+              isWorking={busy}
+              supportsConversationRollback
+              latestTurn={{
+                turnId,
+                state: "interrupted",
+                requestedAt: MESSAGE_CREATED_AT,
+                startedAt: MESSAGE_CREATED_AT,
+                completedAt: MESSAGE_CREATED_AT,
+              }}
+              turnDiffSummaries={[
+                {
+                  turnId,
+                  completedAt: MESSAGE_CREATED_AT,
+                  assistantMessageId: MessageId.make("assistant:stopped-turn"),
+                  checkpointTurnCount: 1,
+                  checkpointRef: CheckpointRef.make("refs/t3/checkpoints/stopped/1"),
+                  status: "missing",
+                  files: [],
+                },
+              ]}
+              onRevertToTurnCount={onRevertToTurnCount}
+              onForkMessage={onForkMessage}
+            />,
+          );
+        });
+        const buttons = renderer!.root.findAllByType("button");
+        const edit = buttons.find((button) => button.props["aria-label"] === "Edit from here");
+        const fork = buttons.find(
+          (button) => button.props["aria-label"] === "Fork after this turn",
+        );
+        expect(edit).toBeDefined();
+        expect(fork).toBeDefined();
+        expect(
+          renderer!.root
+            .findAllByType("div")
+            .some(
+              (node) =>
+                node.props.className?.includes("tabular-nums") &&
+                node.props.className?.split(" ").includes("opacity-100") &&
+                !node.props.className?.split(" ").includes("opacity-0"),
+            ),
+        ).toBe(true);
+        expect(Boolean(edit!.props.disabled)).toBe(busy);
+        expect(Boolean(fork!.props.disabled)).toBe(busy);
+        if (!busy) {
+          const clickEvent = () => ({
+            nativeEvent: {},
+            preventDefault: vi.fn(),
+            stopPropagation: vi.fn(),
+            defaultPrevented: false,
+          });
+          await act(() => edit!.props.onClick(clickEvent()));
+          await act(() => fork!.props.onClick(clickEvent()));
+          expect(onRevertToTurnCount).toHaveBeenCalledWith(0, user.message.id);
+          expect(onForkMessage).toHaveBeenCalledWith(user.message.id);
+        }
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
   it("renders previous and next controls with the minimap", () => {
     const first = buildUserTimelineEntry("First turn");
     const secondBase = buildUserTimelineEntry("Second turn");

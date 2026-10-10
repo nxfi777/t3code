@@ -60,6 +60,26 @@ type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
 const MAX_THREAD_CHECKPOINTS = 500;
 
+/** Preserve the primary prompt's exact association before latestTurn advances. */
+function bindLatestTurnUserMessage(thread: OrchestrationThread) {
+  const latest = thread.latestTurn;
+  if (!latest) return thread.messages;
+  const users = thread.messages.filter(
+    (message) => message.role === "user" && message.createdAt === latest.requestedAt,
+  );
+  const user = users.length === 1 ? users[0] : undefined;
+  if (
+    !user ||
+    user.turnId !== null ||
+    isImportedAgentSessionMessageId(user.id) ||
+    thread.messages.some((message) => message.role === "user" && message.turnId === latest.turnId)
+  )
+    return thread.messages;
+  return thread.messages.map((message) =>
+    message === user ? { ...message, turnId: latest.turnId } : message,
+  );
+}
+
 // Async questions can stay open while the agent produces more activity.
 // Match the database snapshot's pending-question retention.
 function retainThreadActivities(activities: OrchestrationThread["activities"]) {
@@ -863,6 +883,7 @@ export function projectEvent(
         return {
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
+            messages: bindLatestTurnUserMessage(thread),
             session,
             latestTurn:
               session.status === "running" && session.activeTurnId !== null
@@ -985,6 +1006,10 @@ export function projectEvent(
         return {
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
+            messages:
+              thread.latestTurn?.turnId === payload.turnId
+                ? bindLatestTurnUserMessage(thread)
+                : thread.messages,
             checkpoints,
             latestTurn:
               turnStillRunning ||

@@ -971,6 +971,87 @@ describe("applyThreadDetailEvent", () => {
   });
 
   describe("thread.session-set", () => {
+    it.each(["exact", "duplicate", "conflicting", "imported", "steering"] as const)(
+      "retains only an exact primary prompt when a new turn precedes the old checkpoint: %s",
+      (mode) => {
+        const requestedAt = "2026-04-01T07:00:00.000Z";
+        const laterAt = "2026-04-01T08:00:00.000Z";
+        const user = {
+          id: MessageId.make(mode === "imported" ? "import:fork:old:0" : "stopped-user"),
+          role: "user" as const,
+          text: "Inspect alerts",
+          turnId: mode === "conflicting" ? TurnId.make("other-turn") : null,
+          streaming: false,
+          createdAt: mode === "steering" ? laterAt : requestedAt,
+          updatedAt: requestedAt,
+        };
+        const thread: OrchestrationThread = {
+          ...baseThread,
+          messages: [
+            user,
+            ...(mode === "duplicate" ? [{ ...user, id: MessageId.make("duplicate") }] : []),
+          ],
+          latestTurn: {
+            turnId: TurnId.make("old-turn"),
+            state: "interrupted",
+            requestedAt,
+            startedAt: requestedAt,
+            completedAt: laterAt,
+            assistantMessageId: null,
+          },
+        };
+        const result = applyThreadDetailEvent(thread, {
+          ...baseEventFields,
+          sequence: 9,
+          occurredAt: laterAt,
+          aggregateKind: "thread",
+          aggregateId: thread.id,
+          type: "thread.session-set",
+          payload: {
+            threadId: thread.id,
+            session: {
+              threadId: thread.id,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: TurnId.make("new-turn"),
+              lastError: null,
+              updatedAt: laterAt,
+            },
+          },
+        });
+        expect(result.kind).toBe("updated");
+        if (result.kind !== "updated") return;
+        expect(result.thread.latestTurn?.turnId).toBe("new-turn");
+        expect(result.thread.messages[0]).toEqual({
+          ...user,
+          turnId: mode === "exact" ? "old-turn" : user.turnId,
+        });
+        const afterCheckpoint = applyThreadDetailEvent(result.thread, {
+          ...baseEventFields,
+          sequence: 10,
+          occurredAt: laterAt,
+          aggregateKind: "thread",
+          aggregateId: thread.id,
+          type: "thread.turn-diff-completed",
+          payload: {
+            threadId: thread.id,
+            turnId: TurnId.make("old-turn"),
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("ref-old"),
+            status: "missing",
+            files: [],
+            assistantMessageId: MessageId.make("assistant:old-turn"),
+            completedAt: laterAt,
+          },
+        });
+        expect(afterCheckpoint.kind).toBe("updated");
+        if (afterCheckpoint.kind === "updated") {
+          expect(afterCheckpoint.thread.latestTurn?.turnId).toBe("new-turn");
+          expect(afterCheckpoint.thread.messages[0]).toEqual(result.thread.messages[0]);
+        }
+      },
+    );
     it("settles a running latestTurn when the session leaves the running status", () => {
       const threadWithRunningTurn: OrchestrationThread = {
         ...baseThread,

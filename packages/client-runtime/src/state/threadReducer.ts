@@ -22,6 +22,26 @@ export type ThreadDetailReducerResult =
   | { readonly kind: "deleted" }
   | { readonly kind: "unchanged" };
 
+/** Preserve the primary prompt's exact association before latestTurn advances. */
+function bindLatestTurnUserMessage(thread: OrchestrationThread) {
+  const latest = thread.latestTurn;
+  if (!latest) return thread.messages;
+  const users = thread.messages.filter(
+    (message) => message.role === "user" && message.createdAt === latest.requestedAt,
+  );
+  const user = users.length === 1 ? users[0] : undefined;
+  if (
+    !user ||
+    user.turnId !== null ||
+    isImportedAgentSessionMessageId(user.id) ||
+    thread.messages.some((message) => message.role === "user" && message.turnId === latest.turnId)
+  )
+    return thread.messages;
+  return thread.messages.map((message) =>
+    message === user ? { ...message, turnId: latest.turnId } : message,
+  );
+}
+
 /** Keep only a legacy route supplied by the server; detail events cannot resolve project hosts. */
 function withPullRequests(
   thread: OrchestrationThread,
@@ -402,7 +422,11 @@ export function applyThreadDetailEvent(
       };
 
       let found = false;
-      const messages = thread.messages.map((entry) => {
+      const previousMessages =
+        message.role === "assistant" && message.turnId !== thread.latestTurn?.turnId
+          ? bindLatestTurnUserMessage(thread)
+          : thread.messages;
+      const messages = previousMessages.map((entry) => {
         if (entry.id !== message.id) return entry;
         found = true;
         return {
@@ -529,6 +553,7 @@ export function applyThreadDetailEvent(
         kind: "updated",
         thread: {
           ...thread,
+          messages: bindLatestTurnUserMessage(thread),
           session: event.payload.session,
           latestTurn,
           updatedAt: event.occurredAt,
@@ -618,7 +643,16 @@ export function applyThreadDetailEvent(
 
       return {
         kind: "updated",
-        thread: { ...thread, checkpoints, latestTurn, updatedAt: event.occurredAt },
+        thread: {
+          ...thread,
+          messages:
+            thread.latestTurn?.turnId === event.payload.turnId
+              ? bindLatestTurnUserMessage(thread)
+              : thread.messages,
+          checkpoints,
+          latestTurn,
+          updatedAt: event.occurredAt,
+        },
       };
     }
 

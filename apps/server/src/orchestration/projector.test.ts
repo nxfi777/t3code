@@ -607,7 +607,19 @@ describe("orchestration projector", () => {
         completedAt: recentAt,
         assistantMessageId: MessageId.make("latest-response"),
       };
-      model = { ...model, threads: model.threads.map((thread) => ({ ...thread, latestTurn })) };
+      const user = {
+        id: MessageId.make("silent-user"),
+        role: "user" as const,
+        text: "Inspect alerts",
+        turnId: null,
+        streaming: false,
+        createdAt: latestTurn.requestedAt,
+        updatedAt: latestTurn.requestedAt,
+      };
+      model = {
+        ...model,
+        threads: model.threads.map((thread) => ({ ...thread, latestTurn, messages: [user] })),
+      };
       const after = yield* projectEvent(
         model,
         event(
@@ -629,6 +641,32 @@ describe("orchestration projector", () => {
       expect(after.threads[0]?.latestTurn).toEqual(latestTurn);
       expect(after.threads[0]?.updatedAt).toBe(recentAt);
       expect(after.threads[0]?.checkpoints).toHaveLength(1);
+      expect(after.threads[0]?.messages[0]).toEqual(user);
+
+      // A new turn may start before the old checkpoint arrives. Preserve the
+      // old primary prompt while its exact request timestamp is still known.
+      const advanced = yield* projectEvent(
+        model,
+        event(
+          2,
+          "thread.session-set",
+          {
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: "new-turn",
+              lastError: null,
+              updatedAt: recentAt,
+            },
+          },
+          recentAt,
+        ),
+      );
+      expect(advanced.threads[0]?.latestTurn?.turnId).toBe("new-turn");
+      expect(advanced.threads[0]?.messages[0]).toEqual({ ...user, turnId: latestTurn.turnId });
     }),
   );
 

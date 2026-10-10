@@ -2,8 +2,8 @@ import {
   ConnectionTransientError,
   PrimaryConnectionTarget,
 } from "@t3tools/client-runtime/connection";
-import { EnvironmentId } from "@t3tools/contracts";
-import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
+import { EnvironmentId, ThreadId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import { ConnectionCatalogDocument, EnvironmentCacheStore } from "@t3tools/client-runtime/platform";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -16,6 +16,7 @@ import {
   makeBrowserGitHubRoutingPermissions,
   makeCatalogBackend,
   makeCatalogStore,
+  connectionStorageLayer,
 } from "./storage";
 
 const emptyCatalog = {
@@ -33,6 +34,88 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
+
+it.effect(
+  "reloads v4 thread snapshots while retaining other local data and v5 associations",
+  () => {
+    const stores = new Map<string, Map<unknown, unknown>>([
+      ["settings", new Map([["theme", "dark"]])],
+      ["drafts", new Map([["draft", "Unsent prompt"]])],
+    ]);
+    const database = {
+      close: () => {},
+      transaction: (name: string) => {
+        const rows = stores.get(name) ?? new Map<unknown, unknown>();
+        stores.set(name, rows);
+        const transaction = Object.assign(new EventTarget(), {
+          objectStore: () => ({
+            get: (key: unknown) => {
+              const request = Object.assign(new EventTarget(), { result: rows.get(key) });
+              queueMicrotask(() => request.dispatchEvent(new Event("success")));
+              return request;
+            },
+            put: (value: unknown, key: unknown) => {
+              rows.set(key, value);
+              queueMicrotask(() => transaction.dispatchEvent(new Event("complete")));
+            },
+          }),
+        });
+        return transaction;
+      },
+    };
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("indexedDB", {
+      open: () => {
+        const request = Object.assign(new EventTarget(), { result: database });
+        queueMicrotask(() => request.dispatchEvent(new Event("success")));
+        return request;
+      },
+    });
+    return Effect.gen(function* () {
+      const cache = yield* EnvironmentCacheStore;
+      const environmentId = EnvironmentId.make("cache-test");
+      const threadId = ThreadId.make("thread-1");
+      const snapshot = {
+        snapshotSequence: 7,
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("project-1"),
+          title: "Cached",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: null,
+          worktreePath: null,
+          latestTurn: null,
+          createdAt: "2026-10-10T00:00:00.000Z",
+          updatedAt: "2026-10-10T00:00:00.000Z",
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          pullRequests: [],
+          deletedAt: null,
+          messages: [],
+          proposedPlans: [],
+          activities: [],
+          checkpoints: [],
+          session: null,
+        },
+      };
+      yield* cache.saveThread(environmentId, snapshot);
+      expect(Option.getOrThrow(yield* cache.loadThread(environmentId, threadId))).toEqual(snapshot);
+      const [key, encoded] = [...stores.get("thread")!.entries()][0]!;
+      expect(typeof encoded).toBe("string");
+      expect(encoded).toContain('"schemaVersion":5');
+      stores
+        .get("thread")!
+        .set(key, (encoded as string).replace('"schemaVersion":5', '"schemaVersion":4'));
+      const rejected = yield* cache.loadThread(environmentId, threadId).pipe(Effect.flip);
+      expect(rejected.operation).toBe("load-thread");
+      expect(stores.get("settings")?.get("theme")).toBe("dark");
+      expect(stores.get("drafts")?.get("draft")).toBe("Unsent prompt");
+    }).pipe(Effect.provide(connectionStorageLayer));
+  },
+);
 
 describe("makeCatalogStore", () => {
   it.effect("quarantines malformed catalogs and starts from an empty document", () =>

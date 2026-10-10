@@ -2629,6 +2629,67 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
   const activityIds = (snapshot: { thread: { activities: ReadonlyArray<{ id: string }> } }) =>
     snapshot.thread.activities.map((activity) => activity.id).toSorted();
 
+  it.effect.each([
+    "pending-message",
+    "requested-at",
+    "duplicate-users",
+    "duplicate-turns",
+    "conflicting-turn",
+    "imported-prefix",
+  ] as const)("hydrates older silent user turn associations safely: %s", (mode) =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const query = yield* ProjectionSnapshotQuery;
+      const requestedAt = "2026-03-01T00:00:00.000Z";
+      const messageId = mode === "imported-prefix" ? "import:fork:old:0" : "user-msg-1";
+      yield* sql`DELETE FROM projection_thread_messages WHERE message_id = 'turn-1-reply'`;
+      yield* sql`UPDATE projection_turns SET
+        state = 'interrupted', pending_message_id = ${mode === "pending-message" ? messageId : null},
+        checkpoint_turn_count = 1, checkpoint_status = 'missing', checkpoint_ref = 'ref-1',
+        assistant_message_id = 'assistant:turn-1'
+        WHERE thread_id = 'thread-w' AND turn_id = 'turn-1'`;
+      yield* sql`UPDATE projection_thread_messages SET message_id = ${messageId},
+        turn_id = ${mode === "conflicting-turn" ? "explicit-other-turn" : null}
+        WHERE message_id = 'user-msg-1'`;
+      if (mode === "duplicate-users")
+        yield* sql`INSERT INTO projection_thread_messages
+          (message_id, thread_id, role, text, is_streaming, created_at, updated_at)
+          VALUES ('steering-user', 'thread-w', 'user', 'Another request', 0, ${requestedAt}, ${requestedAt})`;
+      if (mode === "duplicate-turns")
+        yield* sql`UPDATE projection_turns SET requested_at = ${requestedAt}
+          WHERE thread_id = 'thread-w' AND turn_id = 'turn-2'`;
+      const expectedTurnId =
+        mode === "pending-message" || mode === "requested-at"
+          ? "turn-1"
+          : mode === "conflicting-turn"
+            ? "explicit-other-turn"
+            : null;
+      const full = yield* query.getSnapshot();
+      const detail = yield* query.getThreadDetailById(threadW);
+      const windowed = yield* query.getThreadDetailSnapshot(threadW, { turnLimit: 20 });
+      assert(Option.isSome(detail));
+      assert(Option.isSome(windowed));
+      for (const thread of [full.threads[0]!, detail.value, windowed.value.thread]) {
+        const message = thread.messages.find((message) => message.id === messageId);
+        // Explicit turn ids outside the requested page remain outside that page.
+        if (mode === "conflicting-turn" && thread === windowed.value.thread) continue;
+        assert.strictEqual(message?.turnId, expectedTurnId);
+        assert.strictEqual(message?.createdAt, requestedAt);
+        assert.strictEqual(message?.updatedAt, requestedAt);
+        assert.strictEqual(thread.latestTurn?.turnId, "turn-5");
+      }
+      const stored = yield* sql<{ turnId: string | null; updatedAt: string }>`
+        SELECT turn_id AS "turnId", updated_at AS "updatedAt"
+        FROM projection_thread_messages WHERE message_id = ${messageId}`;
+      assert.strictEqual(
+        stored[0]?.turnId,
+        mode === "conflicting-turn" ? "explicit-other-turn" : null,
+      );
+      assert.strictEqual(stored[0]?.updatedAt, requestedAt);
+    }),
+  );
+
   it.effect("returns the full thread with no page metadata when no window is requested", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();

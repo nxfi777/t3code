@@ -112,13 +112,16 @@ const harness = (
     failNative?: boolean;
     failImport?: boolean;
     historyIssue?: "unindexed" | "misordered";
+    source?: OrchestrationThread;
+    prepareTurns?: (turns: ProjectionTurn[]) => ProjectionTurn[];
+    expectedTexts?: string[];
   } = {},
 ) => {
-  const original = source(options.busy);
-  const turns: ProjectionTurn[] = original.checkpoints.map((checkpoint, index) => ({
+  const original = options.source ?? source(options.busy);
+  let turns: ProjectionTurn[] = original.checkpoints.map((checkpoint, index) => ({
     threadId: sourceId,
     turnId: checkpoint.turnId,
-    pendingMessageId: null,
+    pendingMessageId: MessageId.make(`user${index + 1}`),
     sourceProposedPlanThreadId: null,
     sourceProposedPlanId: null,
     assistantMessageId: checkpoint.assistantMessageId,
@@ -131,6 +134,7 @@ const harness = (
     checkpointStatus: checkpoint.status,
     checkpointFiles: [],
   }));
+  if (options.prepareTurns) turns = options.prepareTurns(turns);
   if (options.historyIssue === "unindexed")
     turns.unshift({
       ...turns[0]!,
@@ -183,10 +187,9 @@ const harness = (
         Effect.gen(function* () {
           forkCalls++;
           const child = model.threads.find((thread) => thread.id === targetId);
-          expect(child?.messages.map((message) => message.text)).toEqual([
-            "Remember ALPHA",
-            "ALPHA saved",
-          ]);
+          expect(child?.messages.map((message) => message.text)).toEqual(
+            options.expectedTexts ?? ["Remember ALPHA", "ALPHA saved"],
+          );
           expect(child?.session?.status).toBe("starting");
           expect(input.sourceTurnId).toBe("turn1");
           expect(input.retainedTurnCount).toBe(1);
@@ -226,6 +229,159 @@ const fork = Effect.flatMap(ThreadFork.ThreadFork, (service) =>
     threadId: sourceId,
     targetThreadId: targetId,
     messageId: MessageId.make("assistant1"),
+  }),
+);
+
+const forkUser = Effect.flatMap(ThreadFork.ThreadFork, (service) =>
+  service.fork({
+    threadId: sourceId,
+    targetThreadId: targetId,
+    messageId: MessageId.make("user1"),
+  }),
+);
+
+function interruptedSource(withReasoning = true) {
+  const original = source();
+  return decodeThread({
+    ...original,
+    session: { ...original.session, status: "stopped" },
+    latestTurn: {
+      turnId: "turn1",
+      state: "interrupted",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: "2026-10-09T01:00:05.000Z",
+      assistantMessageId: null,
+    },
+    messages: [
+      original.messages[0],
+      ...(withReasoning
+        ? [
+            {
+              ...original.messages[1],
+              id: "reasoning1",
+              role: "reasoning",
+              text: "Thinking before interruption",
+            },
+          ]
+        : []),
+    ],
+    checkpoints: [{ ...original.checkpoints[0], assistantMessageId: "assistant:turn1" }],
+  });
+}
+
+it.effect.each(["pending-message", "request-time", "no-output"] as const)(
+  "forks an interrupted user-only turn with exact %s association without changing the source",
+  (association) =>
+    Effect.gen(function* () {
+      const h = harness({
+        source: interruptedSource(association !== "no-output"),
+        expectedTexts: ["Remember ALPHA"],
+        prepareTurns: (turns) =>
+          turns.map((turn) => ({
+            ...turn,
+            state: "interrupted",
+            requestedAt: now,
+            pendingMessageId: association === "pending-message" ? MessageId.make("user1") : null,
+          })),
+      });
+      yield* forkUser.pipe(Effect.provide(h.layer));
+      const child = h.model().threads.find((thread) => thread.id === targetId)!;
+      expect(child.messages.map((message) => [message.role, message.text])).toEqual([
+        ["user", "Remember ALPHA"],
+      ]);
+      expect(child.messages[0]?.attachments).toEqual(h.original.messages[0]?.attachments);
+      expect(h.forkCalls()).toBe(1);
+      expect(h.model().threads.find((thread) => thread.id === sourceId)).toEqual(h.original);
+    }),
+);
+
+it.effect.each(["ordinary", "queued-later-prompt"] as const)(
+  "user-row fork includes its complete response and excludes later turns: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const original = source();
+      const h = harness({
+        source:
+          scenario === "ordinary"
+            ? original
+            : {
+                ...original,
+                messages: [
+                  original.messages[0]!,
+                  original.messages[2]!,
+                  original.messages[1]!,
+                  original.messages[3]!,
+                ],
+              },
+      });
+      yield* forkUser.pipe(Effect.provide(h.layer));
+      expect(
+        h
+          .model()
+          .threads.find((thread) => thread.id === targetId)
+          ?.messages.map((message) => message.text),
+      ).toEqual(["Remember ALPHA", "ALPHA saved"]);
+      expect(h.model().threads.find((thread) => thread.id === sourceId)).toEqual(h.original);
+    }),
+);
+
+it.effect.each([
+  "duplicate-users",
+  "duplicate-turns",
+  "no-match",
+  "pending-turn",
+  "conflicting-turn-id",
+] as const)("rejects unsafe user-turn associations before any child or native fork: %s", (reason) =>
+  Effect.gen(function* () {
+    const original = interruptedSource();
+    const h = harness({
+      source:
+        reason === "duplicate-users"
+          ? {
+              ...original,
+              messages: [
+                original.messages[0]!,
+                { ...original.messages[0]!, id: MessageId.make("other-user") },
+                original.messages[1]!,
+              ],
+            }
+          : reason === "conflicting-turn-id"
+            ? {
+                ...original,
+                messages: [
+                  { ...original.messages[0]!, turnId: TurnId.make("different-turn") },
+                  original.messages[1]!,
+                ],
+              }
+            : original,
+      prepareTurns: (turns) => {
+        const turn = {
+          ...turns[0]!,
+          state: "interrupted" as const,
+          requestedAt: now,
+          pendingMessageId: null,
+        };
+        if (reason === "duplicate-turns")
+          return [turn, { ...turn, turnId: TurnId.make("other-turn"), checkpointTurnCount: 2 }];
+        if (reason === "pending-turn")
+          return [
+            turn,
+            {
+              ...turn,
+              turnId: null,
+              state: "pending",
+              completedAt: null,
+              checkpointTurnCount: null,
+            },
+          ];
+        return [{ ...turn, requestedAt: reason === "no-match" ? "2026-10-09T01:00:01.000Z" : now }];
+      },
+    });
+    yield* forkUser.pipe(Effect.provide(h.layer), Effect.flip);
+    expect(h.forkCalls()).toBe(0);
+    expect(h.stopCalls()).toBe(0);
+    expect(h.model().threads).toEqual([h.original]);
   }),
 );
 

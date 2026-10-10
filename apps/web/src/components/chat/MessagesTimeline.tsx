@@ -2241,7 +2241,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           />
         </div>
       </div>
-      <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100">
+      <div
+        className={cn(
+          "flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100",
+          typeof revertTurnCount === "number" ? "opacity-100" : "opacity-0",
+        )}
+      >
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>
             <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
@@ -2254,6 +2259,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           <div className="flex items-center gap-0.5">
             {typeof revertTurnCount === "number" && (
               <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
+            )}
+            {typeof revertTurnCount === "number" && ctx.onForkMessage && (
+              <ForkMessageButton messageId={row.message.id} afterTurn />
             )}
             {resolvedContext.text && (
               <MessageCopyButton
@@ -2328,8 +2336,41 @@ function RevertUserMessageButton({
         }
       >
         <Undo2Icon className="size-3" />
+        Edit
       </TooltipTrigger>
       <TooltipPopup side="top">Edit from here</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+function ForkMessageButton({
+  messageId,
+  afterTurn = false,
+}: {
+  messageId: MessageId;
+  afterTurn?: boolean;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+  const label = afterTurn ? "Fork after this turn" : "Fork from here";
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={activity.isWorking || activity.isRevertingCheckpoint}
+            onClick={() => ctx.onForkMessage?.(messageId)}
+            aria-label={label}
+          />
+        }
+      >
+        <GitForkIcon className="size-3" />
+        {afterTurn ? "Fork" : null}
+      </TooltipTrigger>
+      <TooltipPopup side="top">{label} · keeps current files</TooltipPopup>
     </Tooltip>
   );
 }
@@ -2475,7 +2516,6 @@ function AssistantMessageMeta({
   alwaysVisible?: boolean;
 }) {
   const ctx = use(TimelineRowCtx);
-  const activity = use(TimelineRowActivityCtx);
 
   return (
     <div
@@ -2493,23 +2533,7 @@ function AssistantMessageMeta({
         streaming={copyStreaming}
       />
       {ctx.onForkMessage && ctx.forkableMessageIds.has(message.id) && !message.streaming ? (
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                type="button"
-                size="xs"
-                variant="ghost"
-                disabled={activity.isWorking || activity.isRevertingCheckpoint}
-                onClick={() => ctx.onForkMessage?.(message.id)}
-                aria-label="Fork from here"
-              />
-            }
-          >
-            <GitForkIcon className="size-3" />
-          </TooltipTrigger>
-          <TooltipPopup side="top">Fork from here · keeps current files</TooltipPopup>
-        </Tooltip>
+        <ForkMessageButton messageId={message.id} />
       ) : null}
       {!message.streaming && (
         <Tooltip>

@@ -495,6 +495,34 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const threadPlanProgress = yield* ThreadPlanProgressService;
   const sql = yield* SqlClient.SqlClient;
+  // User messages predate the native turn id. Resolve their primary turn on
+  // reads, including legacy stopped turns with no assistant message. Keep
+  // duplicate/steering requests and imported prefixes unassociated.
+  const messageTurnId = sql`COALESCE(messages.turn_id, CASE
+    WHEN messages.role = 'user' AND messages.message_id NOT LIKE 'import:%' THEN (
+      SELECT CASE WHEN COUNT(*) = 1 THEN MIN(turns.turn_id) END
+      FROM projection_turns AS turns
+      WHERE turns.thread_id = messages.thread_id
+        AND turns.turn_id IS NOT NULL
+        AND (
+          turns.pending_message_id = messages.message_id
+          OR (
+            turns.pending_message_id IS NULL
+            AND turns.requested_at = messages.created_at
+            AND NOT EXISTS (
+              SELECT 1 FROM projection_turns AS direct
+              WHERE direct.thread_id = messages.thread_id
+                AND direct.pending_message_id = messages.message_id
+            )
+            AND (
+              SELECT COUNT(*) FROM projection_thread_messages AS users
+              WHERE users.thread_id = messages.thread_id
+                AND users.role = 'user'
+                AND users.created_at = messages.created_at
+            ) = 1
+          )
+        )
+    ) END)`;
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
   const repositoryIdentityResolutionConcurrency = 4;
   const resolveRepositoryIdentitiesForProjects = Effect.fn(
@@ -734,7 +762,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         SELECT
           message_id AS "messageId",
           thread_id AS "threadId",
-          turn_id AS "turnId",
+          ${messageTurnId} AS "turnId",
           role,
           text,
           attachments_json AS "attachments",
@@ -742,7 +770,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM projection_thread_messages
+        FROM projection_thread_messages AS messages
         ORDER BY thread_id ASC, created_at ASC, message_id ASC
       `,
   });
@@ -1409,7 +1437,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         SELECT
           message_id AS "messageId",
           thread_id AS "threadId",
-          turn_id AS "turnId",
+          ${messageTurnId} AS "turnId",
           role,
           text,
           attachments_json AS "attachments",
@@ -1417,7 +1445,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM projection_thread_messages
+        FROM projection_thread_messages AS messages
         WHERE thread_id = ${threadId}
         ORDER BY created_at ASC, message_id ASC
       `,
@@ -1822,7 +1850,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         SELECT
           message_id AS "messageId",
           thread_id AS "threadId",
-          turn_id AS "turnId",
+          ${messageTurnId} AS "turnId",
           role,
           text,
           attachments_json AS "attachments",
@@ -1830,7 +1858,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
-        FROM projection_thread_messages
+        FROM projection_thread_messages AS messages
         WHERE thread_id = ${threadId}
           AND (
             turn_id IN (
