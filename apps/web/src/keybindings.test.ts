@@ -1393,6 +1393,28 @@ describe("composer and pull request shortcuts", () => {
 });
 
 describe("Usage shortcuts", () => {
+  it.each(["3", "4"])("leaves macOS screenshot shortcut Command-Shift-%s unhandled", (key) => {
+    const options = {
+      platform: "MacIntel",
+      context: { usagePageOpen: true, isDesktop: true },
+    };
+    assert.isNull(
+      resolveShortcutCommand(
+        event({ key, code: `Digit${key}`, metaKey: true, shiftKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        options,
+      ),
+    );
+    assert.strictEqual(
+      resolveShortcutCommand(
+        event({ key, code: `Digit${key}`, ctrlKey: true, shiftKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        options,
+      ),
+      key === "3" ? "usage.period.month" : "usage.period.quarter",
+    );
+  });
+
   it("scopes letter shortcuts to Usage", () => {
     assert.strictEqual(
       resolveShortcutCommand(event({ key: "t" }), DEFAULT_RESOLVED_KEYBINDINGS, {
