@@ -46,6 +46,7 @@
     "@t3tools/provider-pi": "workspace:*",
     "diff": "8.0.3",
     "effect": "catalog:",
+    "ignore": "7.0.5",
     "jose": "catalog:",
     "node-pty": "^1.2.0-beta.15",
     "playwright-core": "1.60.0",
