@@ -81,8 +81,8 @@ function OpenProjectFilePicker(props: ProjectFilePickerProps & { target: ActiveP
   const { resolvedTheme } = useTheme();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const matches = useMemo(
-    () => getProjectFilePickerMatches(result.entries, result.matchedQuery),
-    [result.entries, result.matchedQuery],
+    () => getProjectFilePickerMatches(result.entries, result.matchedQuery, undefined, target.cwd),
+    [result.entries, result.matchedQuery, target.cwd],
   );
   const hasMatchedQuery = /\S/.test(result.matchedQuery);
   const items = useMemo<CommandPaletteActionItem[]>(

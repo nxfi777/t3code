@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   insertRankedSearchResult,
+  normalizeProjectPathSearchQuery,
   normalizeSearchQuery,
   scoreQueryMatch,
   scoreSubsequenceMatch,
@@ -14,6 +15,35 @@ describe("normalizeSearchQuery", () => {
 
   it("can strip leading trigger characters", () => {
     expect(normalizeSearchQuery("  $ui", { trimLeadingPattern: /^\$+/ })).toBe("ui");
+  });
+});
+
+describe("normalizeProjectPathSearchQuery", () => {
+  it.each([
+    [".gitignore", ".gitignore"],
+    ["@./.GitHub/Workflows", ".github/workflows"],
+    ["./src/../.gitignore", ".gitignore"],
+    ["src/../../other/README.md", "../other/readme.md"],
+    ["../other/README.md", "../other/readme.md"],
+    ["  @/src/ChatComposer.tsx  ", "/src/chatcomposer.tsx"],
+  ])("preserves meaningful path characters in %s", (query, expected) => {
+    expect(normalizeProjectPathSearchQuery(query, "/workspace/project")).toBe(expected);
+  });
+
+  it.each([
+    ["/workspace/project/src/File.ts", "/workspace/project", "src/file.ts"],
+    ["/src/File.ts", "/", "src/file.ts"],
+    ["c:\\src\\File.ts", "C:\\", "src/file.ts"],
+    ["/workspace/Project/src/File.ts", "/workspace/project", "/workspace/project/src/file.ts"],
+    [
+      "/workspace/project-other/src/File.ts",
+      "/workspace/project",
+      "/workspace/project-other/src/file.ts",
+    ],
+    ["C:\\Projects\\App\\src\\File.ts", "C:\\Projects\\App\\", "src/file.ts"],
+    ["\\\\server\\share\\app\\.gitignore", "\\\\server\\share\\app", ".gitignore"],
+  ])("relativizes only a matching workspace prefix: %s", (query, cwd, expected) => {
+    expect(normalizeProjectPathSearchQuery(query, cwd)).toBe(expected);
   });
 });
 

@@ -21,7 +21,7 @@ import type {
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
-import { normalizeSearchQuery } from "@t3tools/shared/searchRanking";
+import { normalizeProjectPathSearchQuery } from "@t3tools/shared/searchRanking";
 
 import { expandHomePathWith } from "../pathExpansion.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -235,9 +235,17 @@ export const make = Effect.gen(function* () {
   const search: WorkspaceEntries["Service"]["search"] = Effect.fn("WorkspaceEntries.search")(
     function* (input) {
       const normalizedCwd = yield* normalizeWorkspaceRoot(input.cwd);
-      const normalizedQuery = normalizeSearchQuery(input.query, {
-        trimLeadingPattern: /^[@./]+/,
-      });
+      const normalizedQuery = normalizeProjectPathSearchQuery(input.query, normalizedCwd);
+      // fff treats parent-directory segments as fuzzy separators. A request
+      // outside this workspace must not silently select a file inside it.
+      if (
+        normalizedQuery === ".." ||
+        normalizedQuery.startsWith("../") ||
+        path.isAbsolute(normalizedQuery) ||
+        isWindowsAbsolutePath(normalizedQuery)
+      ) {
+        return { entries: [], truncated: false };
+      }
       return yield* Effect.gen(function* () {
         const searchIndex = yield* WorkspaceSearchIndex.WorkspaceSearchIndex;
         return yield* searchIndex.search(normalizedQuery, input.limit, input.kind, input.imageOnly);

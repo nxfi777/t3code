@@ -15,6 +15,18 @@ const entries = [
 ] as const;
 
 describe("getProjectFilePickerMatches", () => {
+  it("highlights dotfiles and pasted workspace paths using the searched relative path", () => {
+    assert.deepEqual(
+      getProjectFilePickerMatches(entries, "@./.gitignore").at(-1)?.nameMatchIndices,
+      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    );
+    assert.deepEqual(
+      getProjectFilePickerMatches(entries, "/workspace/apps/web/src/index.ts", 200, "/workspace")[0]
+        ?.pathMatchIndices,
+      Array.from({ length: "apps/web/src/index.ts".length }, (_, index) => index),
+    );
+  });
+
   it("returns files only and preserves index order for an empty query", () => {
     assert.deepEqual(pathsForQuery(entries, ""), [
       { name: "index.ts", path: "apps/web/src/index.ts" },
@@ -76,6 +88,11 @@ describe("getProjectFilePickerMatches", () => {
   it("normalizes path prefixes consistently with server search", () => {
     assert.deepEqual(
       getProjectFilePickerMatches([{ kind: "file", path: "src/index.ts" }], "@/src")[0]
+        ?.pathMatchIndices,
+      [],
+    );
+    assert.deepEqual(
+      getProjectFilePickerMatches([{ kind: "file", path: "src/index.ts" }], "@./src")[0]
         ?.pathMatchIndices,
       [0, 1, 2],
     );

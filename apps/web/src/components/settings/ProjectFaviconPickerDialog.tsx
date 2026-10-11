@@ -54,16 +54,18 @@ export function ProjectFaviconPickerDialog(props: {
   );
   const items = useMemo<CommandPaletteActionItem[]>(
     () =>
-      getProjectFilePickerMatches(result.entries, result.matchedQuery).map((match) => ({
-        kind: "action",
-        value: `project-favicon:${match.path}`,
-        searchTerms: [match.name, match.path],
-        title: match.name,
-        description: match.path,
-        icon: <PierreEntryIcon pathValue={match.path} kind="file" theme={resolvedTheme} />,
-        run: async () => props.onSelect(match.path),
-      })),
-    [props.onSelect, resolvedTheme, result.entries, result.matchedQuery],
+      getProjectFilePickerMatches(result.entries, result.matchedQuery, undefined, props.cwd).map(
+        (match) => ({
+          kind: "action",
+          value: `project-favicon:${match.path}`,
+          searchTerms: [match.name, match.path],
+          title: match.name,
+          description: match.path,
+          icon: <PierreEntryIcon pathValue={match.path} kind="file" theme={resolvedTheme} />,
+          run: async () => props.onSelect(match.path),
+        }),
+      ),
+    [props.cwd, props.onSelect, resolvedTheme, result.entries, result.matchedQuery],
   );
 
   return (

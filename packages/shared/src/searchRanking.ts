@@ -19,6 +19,36 @@ export function normalizeSearchQuery(
     : trimmed.toLowerCase();
 }
 
+/** Normalize file-search triggers without losing dotfiles or a pasted workspace path. */
+export function normalizeProjectPathSearchQuery(input: string, cwd?: string): string {
+  let query = input.trim().replace(/^@+/, "").replaceAll("\\", "/");
+  const root = cwd?.replaceAll("\\", "/").replace(/\/+$/, "");
+  const rootPrefix = root === "" && cwd?.startsWith("/") ? "/" : `${root}/`;
+  const windowsRoot =
+    root !== undefined && (/^[a-z]:(?:\/|$)/i.test(root) || root.startsWith("//"));
+  const comparableQuery = windowsRoot ? query.toLowerCase() : query;
+  const comparablePrefix = windowsRoot ? rootPrefix.toLowerCase() : rootPrefix;
+  if (cwd && comparableQuery.startsWith(comparablePrefix)) {
+    query = query.slice(rootPrefix.length);
+  } else if (query.startsWith("/") || /^[a-z]:\//i.test(query)) {
+    // Unmatched absolute paths retain their root, allowing the server to
+    // reject them rather than fuzzy-match a different workspace's files.
+    return normalizeSearchQuery(query);
+  }
+  // Resolve explicit relative segments, retaining a leading '..' so the
+  // server can reject traversal instead of letting fff fuzzy-match it.
+  const segments: string[] = [];
+  for (const segment of query.replace(/^\/+/, "").replace(/\/+/g, "/").split("/")) {
+    if (segment === ".") continue;
+    if (segment === ".." && segments.length > 0 && segments.at(-1) !== "..") {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return normalizeSearchQuery(segments.join("/"));
+}
+
 export function scoreSubsequenceMatch(value: string, query: string): number | null {
   if (!query) return 0;
 

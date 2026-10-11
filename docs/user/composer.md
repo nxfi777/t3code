@@ -32,6 +32,11 @@ also send files to T3 Code through another app's system share sheet.
 
 See [images and videos](#images-and-videos-in-messages) for previewing and saving media.
 
+Find workspace files with `@` in the composer or `Cmd+P` (`Ctrl+P` on Windows/Linux).
+Use a filename, `src/file.ts`, `./src/file.ts`, or a full path inside the workspace.
+A leading slash means an absolute path: use `@src/file.ts` or `@./src/file.ts` instead
+of `@/src/file.ts`. Paths outside the workspace do not return local substitutes.
+
 ## Send while the agent is working
 
 On web and desktop, a message sent during a running turn waits at the end of the conversation as a

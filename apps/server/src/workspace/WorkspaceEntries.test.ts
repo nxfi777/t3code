@@ -287,6 +287,52 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("finds pasted workspace paths and dotfiles without broadening their query", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-path-query-", git: true });
+        const path = yield* Path.Path;
+        yield* writeTextFile(cwd, "src/CaseFile.ts");
+        yield* writeTextFile(cwd, ".gitignore");
+        yield* writeTextFile(cwd, "gitignore-notes.md");
+
+        const relative = yield* searchWorkspaceEntries({
+          cwd,
+          query: "src/CaseFile.ts",
+          kind: "file",
+          limit: 10,
+        });
+        expect(relative.entries[0]?.path).toBe("src/CaseFile.ts");
+        for (const query of [
+          path.join(cwd, "src/CaseFile.ts"),
+          `@${path.join(cwd, "src/CaseFile.ts")}`,
+          "./src/CaseFile.ts",
+        ]) {
+          expect(yield* searchWorkspaceEntries({ cwd, query, kind: "file", limit: 10 })).toEqual(
+            relative,
+          );
+        }
+        const dotfile = yield* searchWorkspaceEntries({
+          cwd,
+          query: "@./.gitignore",
+          kind: "file",
+          limit: 1,
+        });
+        expect(dotfile.entries).toEqual([{ path: ".gitignore", kind: "file" }]);
+
+        for (const query of [
+          "../src/CaseFile.ts",
+          "src/../../src/CaseFile.ts",
+          "/src/CaseFile.ts",
+          "/other/root/src/CaseFile.ts",
+          "D:\\other\\src\\CaseFile.ts",
+          path.join(`${cwd}-other`, "src/CaseFile.ts"),
+        ]) {
+          const outside = yield* searchWorkspaceEntries({ cwd, query, kind: "file", limit: 10 });
+          expect(outside.entries).toEqual([]);
+        }
+      }),
+    );
+
     it.effect("tracks truncation without sorting every fuzzy match", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ prefix: "t3code-workspace-fuzzy-limit-" });

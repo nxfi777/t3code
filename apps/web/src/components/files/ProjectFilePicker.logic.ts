@@ -1,5 +1,5 @@
 import type { ProjectEntry } from "@t3tools/contracts";
-import { normalizeSearchQuery } from "@t3tools/shared/searchRanking";
+import { normalizeProjectPathSearchQuery } from "@t3tools/shared/searchRanking";
 
 export const PROJECT_FILE_PICKER_RESULT_LIMIT = 200;
 
@@ -46,12 +46,11 @@ export function getProjectFilePickerMatches(
   entries: ReadonlyArray<ProjectEntry>,
   rawQuery: string,
   limit = PROJECT_FILE_PICKER_RESULT_LIMIT,
+  cwd?: string,
 ): ProjectFilePickerMatch[] {
   if (limit <= 0) return [];
 
-  const query = normalizeSearchQuery(rawQuery, {
-    trimLeadingPattern: /^[@./]+/,
-  }).replaceAll(/\s/g, "");
+  const query = normalizeProjectPathSearchQuery(rawQuery, cwd).replaceAll(/\s/g, "");
   const matches: ProjectFilePickerMatch[] = [];
 
   for (const entry of entries) {
