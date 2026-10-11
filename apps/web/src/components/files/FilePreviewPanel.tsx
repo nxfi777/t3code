@@ -184,20 +184,34 @@ function WorkspaceImagePreview(props: {
 function WorkspaceBrowserPreview(props: {
   readonly environmentId: EnvironmentId;
   readonly threadRef: ScopedThreadRef;
+  readonly isDraft: boolean;
   readonly absolutePath: string;
   readonly workspaceRoot: string;
   readonly title: string;
   readonly workspaceMutationId: string | null;
 }) {
-  const insideWorkspace =
-    mediaFileReference(props.absolutePath, props.workspaceRoot).relativePath !== undefined;
+  const relativePath = mediaFileReference(props.absolutePath, props.workspaceRoot).relativePath;
   const resource = useMemo(
-    () => ({
-      _tag: insideWorkspace ? ("workspace-file" as const) : ("media-file" as const),
-      threadId: props.threadRef.threadId,
-      path: props.absolutePath,
-    }),
-    [insideWorkspace, props.threadRef.threadId, props.absolutePath],
+    () =>
+      props.isDraft
+        ? {
+            _tag: "draft-workspace-file" as const,
+            cwd: props.workspaceRoot,
+            path: relativePath ?? props.absolutePath,
+          }
+        : {
+            _tag:
+              relativePath !== undefined ? ("workspace-file" as const) : ("media-file" as const),
+            threadId: props.threadRef.threadId,
+            path: props.absolutePath,
+          },
+    [
+      props.isDraft,
+      props.workspaceRoot,
+      relativePath,
+      props.threadRef.threadId,
+      props.absolutePath,
+    ],
   );
   const assetUrl = useAssetUrlState(props.environmentId, resource);
   const revisionSuffix =
@@ -1230,6 +1244,7 @@ export default function FilePreviewPanel({
               key={absolutePath}
               environmentId={environmentId}
               threadRef={threadRef}
+              isDraft={typeof composerDraftTarget === "string"}
               absolutePath={absolutePath}
               workspaceRoot={cwd}
               title={relativePath}

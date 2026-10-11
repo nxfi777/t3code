@@ -389,6 +389,75 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("finds PDFs, image files and document-only directories in every path search", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-documents-" });
+        yield* writeTextFile(cwd, "GraceMouzannar-WebsiteQuote.pdf", "%PDF-1.7\n");
+        yield* writeTextFile(cwd, "docs/only-pdfs/GraceMouzannar-recap.pdf", "%PDF-1.7\n");
+        yield* writeTextFile(cwd, "images/portrait.png");
+        yield* writeTextFile(cwd, "assets/component-model-viewer-ui.css");
+        const workspace = yield* WorkspaceEntries.WorkspaceEntries;
+        const result = yield* workspace.search({ cwd, query: "GraceMou", limit: 2 });
+        expect(result.entries.map((entry) => entry.path)).toEqual([
+          "GraceMouzannar-WebsiteQuote.pdf",
+          "docs/only-pdfs/GraceMouzannar-recap.pdf",
+        ]);
+        expect(
+          (yield* workspace.search({ cwd, query: "GraceMouzannar-WebsiteQuote.pdf", limit: 1 }))
+            .entries[0]?.path,
+        ).toBe("GraceMouzannar-WebsiteQuote.pdf");
+        expect(
+          (yield* workspace.search({ cwd, query: "only-pdfs", kind: "directory", limit: 5 }))
+            .entries,
+        ).toContainEqual({ path: "docs/only-pdfs", kind: "directory" });
+        expect(
+          (yield* workspace.search({ cwd, query: "", kind: "file", imageOnly: true, limit: 5 }))
+            .entries,
+        ).toEqual([{ path: "images/portrait.png", kind: "file" }]);
+        expect((yield* workspace.list({ cwd })).entries).toContainEqual({
+          path: "GraceMouzannar-WebsiteQuote.pdf",
+          kind: "file",
+        });
+      }),
+    );
+
+    it.effect("keeps exact native code matches ahead of incidental document matches", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        yield* writeTextFile(cwd, "README.md");
+        yield* writeTextFile(cwd, "docs/README.md.pdf");
+        const result = yield* searchWorkspaceEntries({ cwd, query: "README.md", limit: 5 });
+        expect(result.entries[0]?.path).toBe("README.md");
+        expect(result.entries).toContainEqual({ path: "docs/README.md.pdf", kind: "file" });
+      }),
+    );
+
+    it.effect(
+      "respects ignore rules for nested documents and refreshes document additions and deletions",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTempDir();
+          yield* writeTextFile(cwd, ".gitignore", "ignored/\n");
+          yield* writeTextFile(cwd, ".ignore", "hidden.pdf\n");
+          yield* writeTextFile(cwd, ".rgignore", "rg-hidden.pdf\n");
+          yield* writeTextFile(cwd, "ignored/nested/hidden.pdf");
+          yield* writeTextFile(cwd, "hidden.pdf");
+          yield* writeTextFile(cwd, "rg-hidden.pdf");
+          yield* writeTextFile(cwd, "original.pdf");
+          const workspace = yield* WorkspaceEntries.WorkspaceEntries;
+          const before = yield* workspace.search({ cwd, query: ".pdf", limit: 20 });
+          expect(before.entries).toEqual([{ path: "original.pdf", kind: "file" }]);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* fs.remove(path.join(cwd, "original.pdf"));
+          yield* writeTextFile(cwd, "new/nested/added.pdf");
+          yield* workspace.refresh(cwd);
+          expect((yield* workspace.search({ cwd, query: ".pdf", limit: 20 })).entries).toEqual([
+            { path: "new/nested/added.pdf", kind: "file" },
+          ]);
+        }),
+    );
+
     it.effect("returns only directories for the directory filter", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ prefix: "t3code-workspace-directory-filter-" });

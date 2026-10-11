@@ -30,6 +30,60 @@ function fileItem(relativePath: string): FileItem {
   };
 }
 
+it.effect(
+  "overfetches a bounded native page when current ignore rules hide its leading matches",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const items = [
+          ...Array.from({ length: 10 }, (_, index) => fileItem(`ignored/keep-${index}.txt`)),
+          fileItem("keep-first.txt"),
+          fileItem("keep-second.txt"),
+        ];
+        const fileSearch = vi.fn((_query: string, options: { pageSize: number }) => ({
+          ok: true as const,
+          value: {
+            items: items.slice(0, options.pageSize),
+            scores: [],
+            totalMatched: items.length,
+            totalFiles: items.length,
+          },
+        }));
+        const finder = {
+          destroy: vi.fn(),
+          waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+          fileSearch,
+          mixedSearch: vi.fn(() => ({
+            ok: true as const,
+            value: {
+              items: items.map((item) => ({ type: "file" as const, item })),
+              scores: [],
+              totalMatched: items.length,
+            },
+          })),
+        } as unknown as FileFinder;
+        vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+        const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project", "paths", {
+          read: Effect.succeed({
+            entries: [
+              { path: "keep-first.txt", kind: "file" as const },
+              { path: "keep-second.txt", kind: "file" as const },
+            ],
+            truncated: false,
+          }),
+          invalidate: Effect.void,
+        });
+        const result = yield* searchIndex.search("keep", 2, "file");
+        expect(result.entries.map((entry) => entry.path)).toEqual([
+          "keep-first.txt",
+          "keep-second.txt",
+        ]);
+        expect(fileSearch.mock.calls.map((call) => call[1].pageSize)).toEqual([3, 6, 12]);
+        expect(result.truncated).toBe(false);
+      }),
+    ),
+);
+
 it.effect("filters image searches before applying the result limit", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -61,6 +115,49 @@ it.effect("filters image searches before applying the result limit", () =>
       expect(resultWithDirectoryKind.entries).toEqual([{ kind: "file", path: "public/icon.svg" }]);
       expect(fileSearch).toHaveBeenCalledTimes(2);
       expect(fileSearch).toHaveBeenCalledWith("", { pageSize: 25_002 });
+    }),
+  ),
+);
+
+it.effect("preserves native code order around exact matches while adding documents", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const paths = ["README.guide.md", "README.md", "README.test.md"];
+      const items = paths.map(fileItem);
+      const finder = {
+        destroy: vi.fn(),
+        waitForIndexReady: vi.fn(async () => ({ ok: true as const, value: true })),
+        fileSearch: vi.fn(() => ({
+          ok: true as const,
+          value: { items, scores: [], totalMatched: items.length, totalFiles: items.length },
+        })),
+        mixedSearch: vi.fn(() => ({
+          ok: true as const,
+          value: {
+            items: items.map((item) => ({ type: "file" as const, item })),
+            scores: [],
+            totalMatched: items.length,
+          },
+        })),
+      } as unknown as FileFinder;
+      vi.spyOn(FileFinder, "create").mockReturnValueOnce({ ok: true, value: finder });
+      const searchIndex = yield* WorkspaceSearchIndex.make("/workspace/project", "paths", {
+        read: Effect.succeed({
+          entries: [...paths, "README.md.pdf"].map((path) => ({ path, kind: "file" as const })),
+          truncated: false,
+        }),
+        invalidate: Effect.void,
+      });
+      const result = yield* searchIndex.search("readme.md", 10, "file");
+      expect(result.entries.map((entry) => entry.path)).toEqual([
+        "README.guide.md",
+        "README.md",
+        "README.md.pdf",
+        "README.test.md",
+      ]);
+      expect(
+        result.entries.filter((entry) => paths.includes(entry.path)).map((entry) => entry.path),
+      ).toEqual(paths);
     }),
   ),
 );
