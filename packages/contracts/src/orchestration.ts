@@ -1572,6 +1572,18 @@ const ThreadMessageUserAppendCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/** Records the native turn that accepted an already persisted user message. */
+const ThreadMessageUserBindTurnCommand = Schema.Struct({
+  type: Schema.Literal("thread.message.user.bind-turn"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  turnId: TurnId,
+  // Historical proof must still match a terminal local turn and this exact
+  // stored text when the engine acquires its dispatch lock.
+  verifiedHistory: Schema.optional(Schema.Struct({ text: Schema.String })),
+});
+
 const ThreadProposedPlanUpsertCommand = Schema.Struct({
   type: Schema.Literal("thread.proposed-plan.upsert"),
   commandId: CommandId,
@@ -1672,6 +1684,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadMessageReasoningCompleteCommand,
   ThreadHistoryImportCommand,
   ThreadMessageUserAppendCommand,
+  ThreadMessageUserBindTurnCommand,
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,

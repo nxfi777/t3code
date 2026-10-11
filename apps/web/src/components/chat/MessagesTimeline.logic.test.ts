@@ -55,7 +55,7 @@ describe("streaming row projection", () => {
         id: MessageId.make("history-user"),
         role: "user",
         text: "Inspect",
-        turnId: null,
+        turnId: historyTurnId,
         createdAt: time(0),
         updatedAt: time(0),
         streaming: false,
@@ -1628,7 +1628,7 @@ describe("deriveMessagesTimelineRows", () => {
             id: "user-1" as never,
             role: "user",
             text: "Do the thing",
-            turnId: null,
+            turnId: "turn-1" as never,
             createdAt: "2026-01-01T00:00:00Z",
             updatedAt: "2026-01-01T00:00:00Z",
             streaming: false,
@@ -1752,6 +1752,51 @@ describe("deriveMessagesTimelineRows", () => {
     },
   );
 
+  it("gives every accepted follow-up the same whole-turn edit boundary", () => {
+    const requestedAt = "2026-10-10T09:01:43.469Z";
+    const completedAt = "2026-10-10T09:39:52.534Z";
+    const turnId = TurnId.make("01a1250b-fd8f-7801-a77c-e674f5a6481c");
+    const timelineEntries: TimelineEntry[] = [requestedAt, "2026-10-10T09:02:12.645Z"].map(
+      (createdAt, index) => ({
+        id: `user-${index}`,
+        kind: "message",
+        createdAt,
+        message: {
+          id: MessageId.make(`user-${index}`),
+          role: "user",
+          text: "Follow-up",
+          turnId,
+          streaming: false,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      }),
+    );
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      supportsConversationRollback: true,
+      latestTurn: { turnId, state: "completed", requestedAt, startedAt: requestedAt, completedAt },
+      turnDiffSummaries: [
+        {
+          turnId,
+          completedAt,
+          assistantMessageId: MessageId.make("reply"),
+          checkpointTurnCount: 14,
+          checkpointRef: CheckpointRef.make("refs/t3/checkpoints/shared/14"),
+          status: "missing",
+          files: [],
+        },
+      ],
+    });
+    expect(
+      rows
+        .filter((row) => row.kind === "message" && row.message.role === "user")
+        .map((row) => (row.kind === "message" ? row.revertTurnCount : undefined)),
+    ).toEqual([13, 13]);
+  });
+
   it.each([
     "different-request",
     "duplicate-users",
@@ -1812,7 +1857,7 @@ describe("deriveMessagesTimelineRows", () => {
     ).toBe(true);
   });
 
-  it.each(["reasoning", "work", "assistant"] as const)(
+  it.each(["reasoning", "work", "assistant", "older-assistant"] as const)(
     "does not attach earlier-turn %s to a queued or steering prompt",
     (output) => {
       const requestedAt = "2026-10-10T09:00:12.676Z";
@@ -1853,7 +1898,7 @@ describe("deriveMessagesTimelineRows", () => {
           createdAt: completedAt,
           message: {
             id: MessageId.make("output"),
-            role: output,
+            role: output === "older-assistant" ? "assistant" : output,
             text: "Earlier turn output",
             turnId,
             streaming: false,
@@ -1867,7 +1912,7 @@ describe("deriveMessagesTimelineRows", () => {
         activeTurnStartedAt: null,
         supportsConversationRollback: true,
         latestTurn: {
-          turnId,
+          turnId: output === "older-assistant" ? TurnId.make("later-turn") : turnId,
           state: "interrupted",
           requestedAt,
           startedAt: requestedAt,
@@ -1878,7 +1923,9 @@ describe("deriveMessagesTimelineRows", () => {
             turnId,
             completedAt,
             assistantMessageId: MessageId.make(
-              output === "assistant" ? "output" : "assistant:earlier-turn",
+              output === "assistant" || output === "older-assistant"
+                ? "output"
+                : "assistant:earlier-turn",
             ),
             checkpointTurnCount: 1,
             checkpointRef: CheckpointRef.make("refs/t3/checkpoints/earlier/1"),
@@ -1889,7 +1936,7 @@ describe("deriveMessagesTimelineRows", () => {
       });
       expect(
         rows.find((row) => row.kind === "message" && row.message.id === "user-0"),
-      ).toMatchObject({ revertTurnCount: 0 });
+      ).toMatchObject({ revertTurnCount: output === "older-assistant" ? undefined : 0 });
       expect(
         rows.find((row) => row.kind === "message" && row.message.id === "user-1"),
       ).toMatchObject({ revertTurnCount: undefined });

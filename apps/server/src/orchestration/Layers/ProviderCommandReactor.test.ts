@@ -895,6 +895,46 @@ describe("ProviderCommandReactor", () => {
     expect(harness.startSession.mock.calls[0]?.[1]).not.toHaveProperty("title");
   });
 
+  it("persists the native turn returned for each accepted primary and steering message", async () => {
+    const harness = await createHarness();
+    const threadId = ThreadId.make("thread-1");
+    for (const [index, text] of ["Start the work", "Also check screenshots"].entries()) {
+      await Effect.runPromise(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-accepted-${index}`),
+          threadId,
+          message: {
+            messageId: asMessageId(`accepted-${index}`),
+            role: "user",
+            text,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        }),
+      );
+      await waitFor(async () => {
+        const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+        return (
+          thread?.messages.find((message) => message.id === `accepted-${index}`)?.turnId ===
+          "turn-1"
+        );
+      });
+    }
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId)!;
+    expect(thread.messages.map((message) => [message.id, message.text, message.turnId])).toEqual([
+      ["accepted-0", "Start the work", "turn-1"],
+      ["accepted-1", "Also check screenshots", "turn-1"],
+    ]);
+    expect(thread.messages.map((message) => message.updatedAt)).toEqual([
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:01.000Z",
+    ]);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+  });
+
   effectIt.effect("forwards only a user-renamed title when starting a provider session", () =>
     Effect.gen(function* () {
       const harness = yield* Effect.promise(() =>

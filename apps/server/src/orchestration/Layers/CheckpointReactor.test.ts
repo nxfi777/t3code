@@ -16,6 +16,7 @@ import {
   CommandId,
   CheckpointRef,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  DEFAULT_SERVER_SETTINGS,
   EventId,
   MessageId,
   ProjectId,
@@ -42,6 +43,8 @@ import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { CheckpointReactorLive } from "./CheckpointReactor.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
@@ -69,6 +72,8 @@ import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
 import { PullRequestService } from "../../pullRequest/PullRequestService.ts";
 import { ServerActivation } from "../../serverActivation.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
@@ -270,6 +275,7 @@ describe("CheckpointReactor", () => {
     | CheckpointReactor
     | CheckpointStore.CheckpointStore
     | ProjectionSnapshotQuery
+    | ProjectionTurnRepository
     | RuntimeReceiptBus.RuntimeReceiptBus,
     unknown
   > | null = null;
@@ -373,6 +379,12 @@ describe("CheckpointReactor", () => {
     });
 
     const layer = CheckpointReactorLive.pipe(
+      Layer.provide(
+        Layer.mock(ProviderSessionDirectory)({ listBindings: () => Effect.succeed([]) }),
+      ),
+      Layer.provide(
+        Layer.mock(ServerSettingsService)({ getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS) }),
+      ),
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(RuntimeReceiptBusTest),
@@ -403,12 +415,14 @@ describe("CheckpointReactor", () => {
       Layer.provideMerge(VcsProcess.layer),
       Layer.provideMerge(ServerConfigLayer),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(ProjectionTurnRepositoryLive),
       Layer.provideMerge(SqlitePersistenceMemory),
     );
 
     runtime = ManagedRuntime.make(layer);
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+    const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
     const reactor = await runtime.runPromise(Effect.service(CheckpointReactor));
     const checkpointStore = await runtime.runPromise(
       Effect.service(CheckpointStore.CheckpointStore),
@@ -514,6 +528,7 @@ describe("CheckpointReactor", () => {
 
     return {
       engine,
+      turns,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       provider,
       cwd,
@@ -1241,6 +1256,66 @@ describe("CheckpointReactor", () => {
         }
       }
     });
+
+  effectIt.effect(
+    "retires a previously accepted pending steer at startup without renumbering its checkpoint",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({ startReactor: false, seedFilesystemCheckpoints: false }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const turnId = asTurnId("persisted-turn-1");
+        const messageId = MessageId.make("accepted-old-steer");
+        const createdAt = "2026-01-01T00:00:02.000Z";
+        yield* seedLegacyConversation(harness.engine, 1);
+        yield* harness.engine.dispatch({
+          type: "thread.turn.diff.complete",
+          commandId: CommandId.make("accepted-old-checkpoint"),
+          threadId,
+          turnId,
+          checkpointTurnCount: 1,
+          checkpointRef: checkpointRefForThreadTurn(threadId, 1),
+          status: "ready",
+          files: [],
+          assistantMessageId: MessageId.make("persisted-response-1"),
+          completedAt: createdAt,
+          createdAt,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.message.user.append",
+          commandId: CommandId.make("accepted-old-steer-append"),
+          threadId,
+          message: { messageId, text: "Accepted follow-up", attachments: [] },
+          createdAt,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.message.user.bind-turn",
+          commandId: CommandId.make("accepted-old-steer-bind"),
+          threadId,
+          messageId,
+          turnId,
+        });
+        const originalTurns = yield* harness.turns.listByThreadId({ threadId });
+        yield* harness.turns.replacePendingTurnStart({
+          threadId,
+          messageId,
+          sourceProposedPlanThreadId: null,
+          sourceProposedPlanId: null,
+          requestedAt: createdAt,
+        });
+        const before = yield* Effect.promise(harness.readModel);
+        yield* Effect.promise(() => harness.startReactor());
+        yield* Effect.promise(harness.drain);
+        const after = yield* Effect.promise(harness.readModel);
+        expect(yield* harness.turns.listByThreadId({ threadId })).toEqual(originalTurns);
+        expect(after.threads).toEqual(before.threads);
+        expect(after.snapshotSequence).toBe(before.snapshotSequence + 1);
+        yield* Effect.promise(() => harness.startReactor());
+        yield* Effect.promise(harness.drain);
+        expect(yield* Effect.promise(harness.readModel)).toEqual(after);
+      }),
+  );
 
   effectIt.effect.each(["single", "now-git"] as const)(
     "repairs persisted conversation boundaries at startup without a new turn: %s",

@@ -80,6 +80,16 @@ export const make = Effect.gen(function* () {
       const userMessages = thread.messages.filter((message) => message.role === "user");
       const turnForUserMessage = (message: (typeof userMessages)[number]) => {
         const byMessageId = turns.filter((turn) => turn.pendingMessageId === message.id);
+        if (message.turnId !== null) {
+          // Accepted steering messages share the primary prompt's native turn.
+          // The persisted association is authoritative; keep pendingMessageId
+          // reserved for that turn's original prompt and reject contradictions.
+          const byTurnId = turns.filter((turn) => turn.turnId === message.turnId);
+          return byTurnId.length === 1 &&
+            byMessageId.every((turn) => turn.turnId === message.turnId)
+            ? byTurnId[0]
+            : undefined;
+        }
         if (byMessageId.length > 0) return byMessageId.length === 1 ? byMessageId[0] : undefined;
         // Older projections did not retain pendingMessageId. Only an exact,
         // unique request timestamp is safe; a nearby message may be steering

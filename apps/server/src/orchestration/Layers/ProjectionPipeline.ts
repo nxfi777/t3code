@@ -1587,6 +1587,25 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         }
 
         case "thread.message-sent": {
+          if (event.payload.role === "user" && event.payload.turnId !== null) {
+            const pending = yield* projectionTurnRepository.getPendingTurnStartByThreadId(
+              event.payload,
+            );
+            if (Option.isSome(pending) && pending.value.messageId === event.payload.messageId) {
+              const nativeTurn = yield* projectionTurnRepository.getByTurnId({
+                threadId: event.payload.threadId,
+                turnId: event.payload.turnId,
+              });
+              // Same-turn steering has no new session-start event to consume
+              // this placeholder. Retire only the accepted message, leaving
+              // the native turn's primary pendingMessageId and newer sends intact.
+              // A primary acknowledgement may precede native turn ingestion;
+              // that placeholder remains for the normal session-start path.
+              if (Option.isSome(nativeTurn))
+                yield* projectionTurnRepository.deletePendingTurnStartByThreadId(event.payload);
+            }
+            return;
+          }
           if (event.payload.turnId === null || event.payload.role !== "assistant") {
             return;
           }

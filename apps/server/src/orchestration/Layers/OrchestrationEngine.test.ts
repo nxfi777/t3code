@@ -33,6 +33,8 @@ import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import * as OrchestrationCommandReceipts from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   makeSqlitePersistenceLive,
   SqlitePersistenceMemory,
@@ -81,6 +83,7 @@ function makeOrchestrationLayer(
     Layer.provide(ThreadPlanProgress.layer),
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provideMerge(ProjectionTurnRepositoryLive),
     Layer.provide(
       repositoryIdentityResolver
         ? Layer.succeed(
@@ -104,8 +107,10 @@ async function createOrchestrationSystem(
   );
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
   return {
     engine,
+    turns,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     readThread: (threadId: ThreadId) =>
       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
@@ -130,6 +135,278 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("retires only an accepted pending steer without changing its native primary or checkpoint", async () => {
+    const system = await createOrchestrationSystem();
+    const threadId = ThreadId.make("accepted-pending-thread");
+    const projectId = ProjectId.make("accepted-pending-project");
+    const turnId = TurnId.make("accepted-native-turn");
+    const dispatch = (command: OrchestrationCommand) => system.run(system.engine.dispatch(command));
+    const start = (id: string) =>
+      dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make(`start-${id}`),
+        threadId,
+        message: { messageId: MessageId.make(id), role: "user", text: id, attachments: [] },
+        interactionMode: "default",
+        runtimeMode: "full-access",
+        createdAt: now(),
+      });
+    const bind = (id: string, suffix = "", historical = false) =>
+      dispatch({
+        type: "thread.message.user.bind-turn",
+        commandId: CommandId.make(`bind-${id}${suffix}`),
+        threadId,
+        messageId: MessageId.make(id),
+        turnId,
+        ...(historical ? { verifiedHistory: { text: id } } : {}),
+      });
+    const session = (status: "running" | "ready") =>
+      dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make(`session-${status}`),
+        threadId,
+        session: {
+          threadId,
+          status,
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: status === "running" ? turnId : null,
+          lastError: null,
+          updatedAt: now(),
+        },
+        createdAt: now(),
+      });
+    const readTurns = () => system.run(system.turns.listByThreadId({ threadId }));
+    try {
+      await dispatch({
+        type: "project.create",
+        commandId: CommandId.make("pending-project"),
+        projectId,
+        title: "Pending",
+        workspaceRoot: "/tmp/pending",
+        createdAt: now(),
+      });
+      await dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("pending-thread"),
+        threadId,
+        projectId,
+        title: "Pending",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      });
+      await start("primary");
+      await bind("primary");
+      // A primary acknowledgement may beat the provider's start event. Keep
+      // its placeholder so that the native row retains the real primary ID.
+      expect(await readTurns()).toMatchObject([{ turnId: null, pendingMessageId: "primary" }]);
+      await session("running");
+      await start("steer");
+      await bind("steer");
+      expect(await readTurns()).toMatchObject([{ turnId, pendingMessageId: "primary" }]);
+
+      await start("later");
+      await bind("steer", "-old-ack");
+      expect((await readTurns()).find((turn) => turn.turnId === null)?.pendingMessageId).toBe(
+        "later",
+      );
+      await bind("later");
+      await dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: CommandId.make("pending-reply"),
+        threadId,
+        turnId,
+        messageId: MessageId.make("reply"),
+        createdAt: now(),
+      });
+      await session("ready");
+      await dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("pending-checkpoint"),
+        threadId,
+        turnId,
+        checkpointTurnCount: 1,
+        checkpointRef: CheckpointRef.make("checkpoint-1"),
+        status: "missing",
+        files: [],
+        assistantMessageId: MessageId.make("reply"),
+        completedAt: now(),
+        createdAt: now(),
+      });
+      const before = await system.readModel();
+      const canonicalTurns = await readTurns();
+      // Simulate a previously persisted version that accepted the steer but
+      // did not consume its pending placeholder. Startup replays the same bind.
+      await system.run(
+        system.turns.replacePendingTurnStart({
+          threadId,
+          messageId: MessageId.make("steer"),
+          sourceProposedPlanThreadId: null,
+          sourceProposedPlanId: null,
+          requestedAt: now(),
+        }),
+      );
+      await bind("steer", "-historical", true);
+      expect(await readTurns()).toEqual(canonicalTurns);
+      const after = await system.readModel();
+      expect(after.threads).toEqual(before.threads);
+      expect(after.snapshotSequence).toBe(before.snapshotSequence + 1);
+      await bind("steer", "-idempotent", true);
+      expect((await system.readModel()).snapshotSequence).toBe(after.snapshotSequence);
+      // A stale history repair cannot consume a newer unaccepted request.
+      await system.run(
+        system.turns.replacePendingTurnStart({
+          threadId,
+          messageId: MessageId.make("newer"),
+          sourceProposedPlanThreadId: null,
+          sourceProposedPlanId: null,
+          requestedAt: now(),
+        }),
+      );
+      await expect(bind("steer", "-newer-pending", true)).rejects.toThrow(
+        "Historical user-turn membership changed",
+      );
+      expect((await readTurns()).find((turn) => turn.turnId === null)?.pendingMessageId).toBe(
+        "newer",
+      );
+    } finally {
+      await system.dispose();
+    }
+  });
+
+  it("binds a persisted accepted message after restart without changing recency or order", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-accepted-message-"));
+    const databasePath = NodePath.join(directory, "state.sqlite");
+    let system = await createOrchestrationSystem(databasePath);
+    const threadId = ThreadId.make("accepted-thread");
+    const projectId = ProjectId.make("accepted-project");
+    try {
+      await system.run(
+        system.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("accepted-project"),
+          projectId,
+          title: "Accepted",
+          workspaceRoot: "/tmp/accepted",
+          createdAt: now(),
+        }),
+      );
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("accepted-thread"),
+          threadId,
+          projectId,
+          title: "Accepted",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: now(),
+        }),
+      );
+      for (const id of ["original", "steering"])
+        await system.run(
+          system.engine.dispatch({
+            type: "thread.message.user.append",
+            commandId: CommandId.make(`append-${id}`),
+            threadId,
+            message: { messageId: MessageId.make(id), text: id, attachments: [] },
+            createdAt: now(),
+          }),
+        );
+      const before = (await system.readModel()).threads[0]!;
+      await system.dispose();
+      system = await createOrchestrationSystem(databasePath);
+      const command = {
+        type: "thread.message.user.bind-turn" as const,
+        commandId: CommandId.make("bind-steering"),
+        threadId,
+        messageId: MessageId.make("steering"),
+        turnId: TurnId.make("native-turn"),
+      };
+      await system.run(system.engine.dispatch(command));
+      const after = (await system.readModel()).threads[0]!;
+      expect(after).toEqual({
+        ...before,
+        messages: before.messages.map((message) =>
+          message.id === "steering" ? { ...message, turnId: command.turnId } : message,
+        ),
+      });
+      const sequence = (await system.readModel()).snapshotSequence;
+      await system.run(
+        system.engine.dispatch({ ...command, commandId: CommandId.make("bind-steering-again") }),
+      );
+      expect((await system.readModel()).snapshotSequence).toBe(sequence);
+      const historical = {
+        ...command,
+        commandId: CommandId.make("historical-missing-turn"),
+        messageId: MessageId.make("original"),
+        verifiedHistory: { text: "original" },
+      };
+      // The old prompt can survive a concurrent rewind even when its proved
+      // native boundary no longer exists. The dispatch lock must reject it.
+      const missing = await system.run(system.engine.dispatch(historical).pipe(Effect.flip));
+      expect(missing._tag).toBe("OrchestrationCommandInvariantError");
+      expect((await system.readModel()).threads[0]?.messages[0]?.turnId).toBeNull();
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.message.assistant.complete",
+          commandId: CommandId.make("terminal-turn"),
+          threadId,
+          messageId: MessageId.make("reply"),
+          turnId: command.turnId,
+          createdAt: now(),
+        }),
+      );
+      const staleText = await system.run(
+        system.engine
+          .dispatch({
+            ...historical,
+            commandId: CommandId.make("historical-stale-text"),
+            verifiedHistory: { text: "text before editing" },
+          })
+          .pipe(Effect.flip),
+      );
+      expect(staleText._tag).toBe("OrchestrationCommandInvariantError");
+      await system.run(
+        system.engine.dispatch({ ...historical, commandId: CommandId.make("historical-valid") }),
+      );
+      expect((await system.readModel()).threads[0]?.messages[0]?.turnId).toBe(command.turnId);
+      await system.run(
+        system.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("historical-racing-start"),
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("new-turn"),
+            lastError: null,
+            updatedAt: now(),
+          },
+          createdAt: now(),
+        }),
+      );
+      const busy = await system.run(
+        system.engine
+          .dispatch({ ...historical, commandId: CommandId.make("historical-busy") })
+          .pipe(Effect.flip),
+      );
+      expect(busy._tag).toBe("OrchestrationCommandInvariantError");
+    } finally {
+      await system.dispose();
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each(["running", "stopped"] as const)(
     "sends async answers with a %s session and rejects old duplicate replies",
     async (status) => {

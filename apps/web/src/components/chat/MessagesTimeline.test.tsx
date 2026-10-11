@@ -345,8 +345,8 @@ describe("MessagesTimeline", () => {
                 !node.props.className?.split(" ").includes("opacity-0"),
             ),
         ).toBe(true);
-        expect(Boolean(edit!.props.disabled)).toBe(busy);
-        expect(Boolean(fork!.props.disabled)).toBe(busy);
+        expect(Boolean(edit!.props["aria-disabled"])).toBe(busy);
+        expect(Boolean(fork!.props["aria-disabled"])).toBe(busy);
         if (!busy) {
           const clickEvent = () => ({
             nativeEvent: {},
@@ -359,6 +359,57 @@ describe("MessagesTimeline", () => {
           expect(onRevertToTurnCount).toHaveBeenCalledWith(0, user.message.id);
           expect(onForkMessage).toHaveBeenCalledWith(user.message.id);
         }
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
+  it.each(["unlinked", "inherited", "unsupported"] as const)(
+    "keeps history actions visible and explains an unavailable %s message",
+    async (reason) => {
+      const user = buildUserTimelineEntry("Follow-up prompt");
+      if (reason === "inherited") user.message.id = MessageId.make("import:fork:source:message");
+      const onRevertToTurnCount = vi.fn();
+      const onForkMessage = vi.fn();
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline
+              {...buildProps()}
+              timelineEntries={[user]}
+              supportsConversationRollback={reason !== "unsupported"}
+              onRevertToTurnCount={onRevertToTurnCount}
+              onForkMessage={onForkMessage}
+            />,
+          );
+        });
+        const buttons = renderer!.root
+          .findAllByType("button")
+          .filter((button) =>
+            ["Edit from here", "Fork after this turn"].includes(button.props["aria-label"]),
+          );
+        expect(buttons).toHaveLength(2);
+        for (const button of buttons) {
+          expect(button.props["aria-disabled"]).toBe(true);
+          expect(button.props.title).toContain(
+            reason === "inherited"
+              ? "came from another chat"
+              : reason === "unsupported"
+                ? "provider cannot"
+                : "could not link this message",
+          );
+          await act(() =>
+            button.props.onClick({
+              nativeEvent: {},
+              preventDefault: vi.fn(),
+              stopPropagation: vi.fn(),
+              defaultPrevented: false,
+            }),
+          );
+        }
+        expect(onRevertToTurnCount).not.toHaveBeenCalled();
+        expect(onForkMessage).not.toHaveBeenCalled();
       } finally {
         await act(() => renderer?.unmount());
       }

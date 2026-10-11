@@ -932,18 +932,12 @@ function buildRevertTurnCountByUserMessageId(input: {
 }): Map<MessageId, number> {
   const byUserMessageId = new Map<MessageId, number>();
   const userCountByCreatedAt = new Map<string, number>();
-  const userCountByTurnId = new Map<TurnId, number>();
   for (const entry of input.timelineEntries) {
     if (entry.kind === "message" && entry.message.role === "user") {
       userCountByCreatedAt.set(
         entry.message.createdAt,
         (userCountByCreatedAt.get(entry.message.createdAt) ?? 0) + 1,
       );
-      if (entry.message.turnId)
-        userCountByTurnId.set(
-          entry.message.turnId,
-          (userCountByTurnId.get(entry.message.turnId) ?? 0) + 1,
-        );
     }
   }
   const entryCount = input.supportsConversationRollback ? input.timelineEntries.length : 0;
@@ -955,7 +949,9 @@ function buildRevertTurnCountByUserMessageId(input: {
 
     const hasExactTurnAssociation = (turnId: TurnId) => {
       if (entry.message.turnId)
-        return entry.message.turnId === turnId && userCountByTurnId.get(turnId) === 1;
+        // Accepted steering messages share the native turn. Editing any of
+        // them restarts the turn and restores its earlier user inputs too.
+        return entry.message.turnId === turnId;
       const latest = input.latestTurn;
       if (latest?.turnId === turnId && latest.requestedAt !== undefined)
         return (
@@ -985,12 +981,7 @@ function buildRevertTurnCountByUserMessageId(input: {
           ? input.turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id)
           : undefined;
       if (summary) {
-        if (
-          input.latestTurn?.turnId === summary.turnId &&
-          input.latestTurn.requestedAt !== undefined &&
-          !hasExactTurnAssociation(summary.turnId)
-        )
-          summary = undefined;
+        if (!hasExactTurnAssociation(summary.turnId)) summary = undefined;
         break;
       }
       const turnId =

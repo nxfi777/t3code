@@ -7,6 +7,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -132,6 +133,71 @@ it.layer(NodeServices.layer)("thread.message.user.append", (it) => {
         "thread.message-sent",
         "thread.turn-start-requested",
       ]);
+    }),
+  );
+
+  it.effect("associates an accepted user message without changing history or activity", () =>
+    Effect.gen(function* () {
+      const readModel = yield* readModelWithThread;
+      const planned = yield* decideOrchestrationCommand({ command: appendCommand, readModel });
+      const event = Array.isArray(planned) ? planned[0]! : planned;
+      const withMessage = yield* projectEvent(readModel, { ...event, sequence: 3 });
+      const original = withMessage.threads[0]!;
+      const command = {
+        type: "thread.message.user.bind-turn" as const,
+        commandId: CommandId.make("bind-accepted"),
+        threadId,
+        messageId,
+        turnId: TurnId.make("native-turn"),
+      };
+      const bound = yield* decideOrchestrationCommand({ command, readModel: withMessage });
+      const events = Array.isArray(bound) ? bound : [bound];
+      expect(events).toHaveLength(1);
+      expect(events[0]!.occurredAt).toBe(original.updatedAt);
+      const projected = yield* projectEvent(withMessage, { ...events[0]!, sequence: 4 });
+      expect(projected.threads[0]).toEqual({
+        ...original,
+        messages: [{ ...original.messages[0]!, turnId: command.turnId }],
+      });
+      expect(yield* decideOrchestrationCommand({ command, readModel: projected })).toEqual([]);
+      const conflict = yield* decideOrchestrationCommand({
+        command: { ...command, turnId: TurnId.make("another-turn") },
+        readModel: projected,
+      }).pipe(Effect.flip);
+      expect(conflict._tag).toBe("OrchestrationCommandInvariantError");
+    }),
+  );
+
+  it.effect("uses the persisted message when the command model no longer contains it", () =>
+    Effect.gen(function* () {
+      const readModel = yield* readModelWithThread;
+      const message = {
+        id: messageId,
+        role: "user" as const,
+        text: "Accepted follow-up",
+        turnId: null,
+        streaming: false,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const planned = yield* decideOrchestrationCommand({
+        readModel,
+        acceptedUserMessage: message,
+        command: {
+          type: "thread.message.user.bind-turn",
+          commandId: CommandId.make("bind-historical"),
+          threadId,
+          messageId,
+          turnId: TurnId.make("native-turn"),
+        },
+      });
+      expect("payload" in planned ? planned.payload : planned[0]?.payload).toMatchObject({
+        messageId,
+        text: message.text,
+        createdAt,
+        updatedAt: createdAt,
+        turnId: "native-turn",
+      });
     }),
   );
 });

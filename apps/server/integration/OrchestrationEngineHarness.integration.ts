@@ -309,6 +309,7 @@ export const makeOrchestrationIntegrationHarness = (
     const checkpointStoreLayer = CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistry.layer));
     const projectionSnapshotQueryLayer = OrchestrationProjectionSnapshotQueryLive;
     const runtimeServicesLayer = Layer.mergeAll(
+      providerSessionDirectoryLayer,
       projectionSnapshotQueryLayer,
       orchestrationLayer.pipe(Layer.provide(projectionSnapshotQueryLayer)),
       ProjectionPendingApprovalRepositoryLive,

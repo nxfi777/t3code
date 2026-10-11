@@ -14,6 +14,7 @@ import {
 } from "./timelineMinimapItems";
 import {
   COMPOSER_CONTEXT_KINDS,
+  isImportedAgentSessionMessageId,
   type AssistantCitation,
   type EnvironmentId,
   type MessageId,
@@ -268,6 +269,7 @@ import { ComputerUseAppIcon } from "~/components/Icons";
 // ---------------------------------------------------------------------------
 
 interface TimelineRowSharedState {
+  supportsConversationRollback: boolean;
   forkableMessageIds: ReadonlySet<MessageId>;
   citationRequest: AssistantCitationTarget | null;
   listRef: React.RefObject<LegendListRef | null>;
@@ -1155,6 +1157,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
+      supportsConversationRollback,
       citationRequest: readyCitationRequest,
       listRef,
       timestampFormat,
@@ -1194,6 +1197,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRemoveQueuedMessage,
     }),
     [
+      supportsConversationRollback,
       readyCitationRequest,
       listRef,
       timestampFormat,
@@ -2241,12 +2245,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           />
         </div>
       </div>
-      <div
-        className={cn(
-          "flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100",
-          typeof revertTurnCount === "number" ? "opacity-100" : "opacity-0",
-        )}
-      >
+      <div className="flex w-full flex-wrap items-center justify-end pe-1 text-xs tabular-nums opacity-100">
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>
             <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
@@ -2257,11 +2256,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
-            {typeof revertTurnCount === "number" && (
-              <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
-            )}
-            {typeof revertTurnCount === "number" && ctx.onForkMessage && (
-              <ForkMessageButton messageId={row.message.id} afterTurn />
+            <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
+            {ctx.onForkMessage && (
+              <ForkMessageButton
+                messageId={row.message.id}
+                afterTurn
+                hasSavedTurn={typeof revertTurnCount === "number"}
+              />
             )}
             {resolvedContext.text && (
               <MessageCopyButton
@@ -2311,15 +2312,37 @@ export function resolvePreviewAnnotationImage(input: {
   );
 }
 
+function historyActionUnavailableReason(
+  ctx: TimelineRowSharedState,
+  activity: TimelineRowActivityState,
+  messageId: MessageId,
+  hasSavedTurn: boolean,
+): string | undefined {
+  if (activity.isRevertingCheckpoint) return "Wait for the current edit to finish.";
+  if (activity.isWorking) return "Stop the agent or wait for it to finish, then edit or fork.";
+  if (!ctx.supportsConversationRollback) return "This provider cannot edit or fork chat history.";
+  if (isImportedAgentSessionMessageId(messageId))
+    return "This message came from another chat. Open that chat to edit or fork it.";
+  if (!hasSavedTurn)
+    return "T3 could not link this message to a saved turn, so Edit and Fork are unavailable.";
+  return undefined;
+}
+
 function RevertUserMessageButton({
   turnCount,
   messageId,
 }: {
-  turnCount: number;
+  turnCount: number | undefined;
   messageId: MessageId;
 }) {
   const ctx = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
+  const unavailableReason = historyActionUnavailableReason(
+    ctx,
+    activity,
+    messageId,
+    typeof turnCount === "number",
+  );
 
   return (
     <Tooltip>
@@ -2329,8 +2352,12 @@ function RevertUserMessageButton({
             type="button"
             size="xs"
             variant="ghost"
-            disabled={activity.isRevertingCheckpoint || activity.isWorking}
-            onClick={() => ctx.onRevertToTurnCount(turnCount, messageId)}
+            aria-disabled={Boolean(unavailableReason)}
+            title={unavailableReason}
+            onClick={() => {
+              if (!unavailableReason && typeof turnCount === "number")
+                ctx.onRevertToTurnCount(turnCount, messageId);
+            }}
             aria-label="Edit from here"
           />
         }
@@ -2338,7 +2365,7 @@ function RevertUserMessageButton({
         <Undo2Icon className="size-3" />
         Edit
       </TooltipTrigger>
-      <TooltipPopup side="top">Edit from here</TooltipPopup>
+      <TooltipPopup side="top">{unavailableReason ?? "Edit from here"}</TooltipPopup>
     </Tooltip>
   );
 }
@@ -2346,12 +2373,15 @@ function RevertUserMessageButton({
 function ForkMessageButton({
   messageId,
   afterTurn = false,
+  hasSavedTurn = true,
 }: {
   messageId: MessageId;
   afterTurn?: boolean;
+  hasSavedTurn?: boolean;
 }) {
   const ctx = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
+  const unavailableReason = historyActionUnavailableReason(ctx, activity, messageId, hasSavedTurn);
   const label = afterTurn ? "Fork after this turn" : "Fork from here";
   return (
     <Tooltip>
@@ -2361,8 +2391,11 @@ function ForkMessageButton({
             type="button"
             size="xs"
             variant="ghost"
-            disabled={activity.isWorking || activity.isRevertingCheckpoint}
-            onClick={() => ctx.onForkMessage?.(messageId)}
+            aria-disabled={Boolean(unavailableReason)}
+            title={unavailableReason}
+            onClick={() => {
+              if (!unavailableReason) ctx.onForkMessage?.(messageId);
+            }}
             aria-label={label}
           />
         }
@@ -2370,7 +2403,9 @@ function ForkMessageButton({
         <GitForkIcon className="size-3" />
         {afterTurn ? "Fork" : null}
       </TooltipTrigger>
-      <TooltipPopup side="top">{label} · keeps current files</TooltipPopup>
+      <TooltipPopup side="top">
+        {unavailableReason ?? `${label} · keeps current files`}
+      </TooltipPopup>
     </Tooltip>
   );
 }

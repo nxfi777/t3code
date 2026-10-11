@@ -1516,9 +1516,31 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const send = providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
+    const send = providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.tap((accepted) =>
+        orchestrationEngine
+          .dispatch({
+            type: "thread.message.user.bind-turn",
+            commandId: CommandId.make(`accepted-turn:${event.eventId}`),
+            threadId: event.payload.threadId,
+            messageId: event.payload.messageId,
+            turnId: accepted.turnId,
+          })
+          .pipe(
+            // A failed metadata acknowledgement must not mark an already
+            // accepted provider turn as a failed send.
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to associate accepted user message with native turn", {
+                threadId: event.payload.threadId,
+                messageId: event.payload.messageId,
+                cause,
+              }),
+            ),
+          ),
+      ),
+      Effect.asVoid,
+      Effect.catchCause(recoverTurnStartFailure),
+    );
     // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
     if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
     yield* send.pipe(

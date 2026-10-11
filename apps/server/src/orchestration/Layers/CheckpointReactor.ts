@@ -36,6 +36,7 @@ import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
 import { forkParked, ServerActivation } from "../../serverActivation.ts";
+import { makeCodexUserMessageRepair } from "../CodexUserMessageRepair.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
@@ -155,6 +156,7 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
   const pullRequests = yield* PullRequestService.PullRequestService;
+  const repairCodexUserMessages = yield* makeCodexUserMessageRepair;
   const queuedEntryRefreshes = new Set<string>();
   const entryRefreshWorker = yield* makeDrainableWorker((cwd: string) =>
     Effect.sync(() => queuedEntryRefreshes.delete(cwd)).pipe(
@@ -365,9 +367,40 @@ const make = Effect.gen(function* () {
     for (const shell of snapshot.threads) {
       if (isConversationBusy(shell)) continue;
       yield* Effect.gen(function* () {
-        const turns = orderedConversationTurns(
+        let turns = orderedConversationTurns(
           yield* projectionTurns.listByThreadId({ threadId: shell.id }),
         );
+        const pending = turns.find((turn) => turn.turnId === null);
+        if (pending?.pendingMessageId) {
+          const requested = yield* projectionSnapshotQuery.getTurnStartMessage({
+            threadId: shell.id,
+            messageId: pending.pendingMessageId,
+          });
+          const message = Option.getOrUndefined(requested)?.message;
+          if (
+            message?.role === "user" &&
+            message.turnId !== null &&
+            turns.some(
+              (turn) =>
+                turn.turnId === message.turnId &&
+                turn.completedAt !== null &&
+                turn.state !== "running" &&
+                turn.state !== "pending",
+            )
+          ) {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.message.user.bind-turn",
+              commandId: yield* serverCommandId("accepted-pending-repair"),
+              threadId: shell.id,
+              messageId: message.id,
+              turnId: message.turnId,
+              verifiedHistory: { text: message.text },
+            });
+            turns = orderedConversationTurns(
+              yield* projectionTurns.listByThreadId({ threadId: shell.id }),
+            );
+          }
+        }
         if (
           !turns.some((turn, index) => turn.checkpointTurnCount !== index + 1) ||
           hasAmbiguousConversationTurns(turns)
@@ -1298,10 +1331,19 @@ const make = Effect.gen(function* () {
     never
   > => {
     if (input.source === "startup") {
-      return repairLegacyConversations().pipe(
-        Effect.catchCauseIf(
-          (cause) => !Cause.hasInterruptsOnly(cause),
-          () => Effect.logWarning("failed to scan legacy conversation boundaries"),
+      return repairCodexUserMessages.pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("failed to scan historical Codex user-turn membership", { cause }),
+        ),
+        Effect.andThen(
+          repairLegacyConversations().pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              () => Effect.logWarning("failed to scan legacy conversation boundaries"),
+            ),
+          ),
         ),
       );
     }

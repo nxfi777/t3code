@@ -104,8 +104,8 @@ into a normal draft.
 
 ## Edit an earlier prompt
 
-On web and desktop, choose **Edit from here** beneath a sent message to rewind
-the conversation to before that message. Choose **Revert and keep changes** to
+On web and desktop, choose **Edit** beneath a sent message to rewind
+the conversation to the start of its turn. Choose **Revert and keep changes** to
 leave workspace files as they are, or **Revert files too** to restore them as well.
 File restore is only offered for threads running in a worktree, and it is
 refused when another thread or agent session also uses that directory, since
@@ -113,16 +113,26 @@ restoring would erase their changes. A thread that works in the project director
 rewinds the conversation only. The selected prompt and its attachments return to the composer for editing and
 resending. Any unsent draft stays above the restored prompt.
 
-This removes the selected message and later conversation from the active thread
+If you sent a follow-up while the agent was working, editing it restarts that
+whole turn. The dialog explains this before you continue. Your prompts from the
+start of the turn through the selected follow-up return together, with their
+attachments and saved context. If T3 cannot restore that context, it leaves the
+history unchanged and explains what is missing.
+
+This removes the selected turn and later conversation from the active thread
 and provider history. It does not undo external actions or separate provider
 memory. The action is available only when the provider supports rewind.
 Grok rewinds conversation history while keeping files as they are. Grok turns
 recorded before native history tracking was enabled may not have a verified
 boundary and cannot be rewound or forked safely.
 
-Older chats outside Git repositories may need one more completed turn before
-their earlier history becomes available for editing or forking. T3 reconstructs
-boundaries from saved turn records and refuses the action if their order is ambiguous.
+Edit and Fork stay visible on user messages. An unavailable action explains why
+when you hover over it or focus it with the keyboard. Stop the agent or wait for
+it to finish before using either action.
+
+T3 reconstructs missing boundaries from saved turn records. On startup, it can
+also recover old plain-text Codex follow-ups when native history identifies their
+turn exactly. Ambiguous history stays unavailable.
 
 ## Fork a conversation
 
@@ -130,6 +140,10 @@ On web and desktop, choose **Fork from here** beneath a completed response to
 continue in a new thread with Claude Code, Codex, or Grok. The original conversation
 stays intact. The fork shares the current workspace files; it does not restore an
 earlier filesystem state.
+
+You can also choose **Fork** beneath a user message, including a follow-up sent
+while the agent was working. This branches after the whole turn containing that
+message, including its replies and other follow-ups.
 
 Inherited messages provide context in the new thread. To branch from a different
 earlier point, return to the original thread. New messages in the fork can be edited

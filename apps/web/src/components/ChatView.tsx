@@ -480,6 +480,11 @@ import {
   waitForStartedServerThread,
   shouldRefocusComposerOnWindowFocus,
 } from "./ChatView.logic";
+import {
+  historyEditMessages,
+  prepareHistoryEdit,
+  restoreHistoryEditAttachment,
+} from "./chat/historyEdit";
 import type { ThreadSyncPhase } from "../threadSync";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
@@ -529,10 +534,7 @@ import {
   supportsServerUpdateThreadContinuation,
 } from "../versionSkew";
 import { useAssetUrls } from "../assets/assetUrls";
-import {
-  ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
-  recallableComposerPrompt,
-} from "./chat/composerPromptHistory";
+import { ATTACHMENT_ONLY_BOOTSTRAP_PROMPT } from "./chat/composerPromptHistory";
 
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_QUEUED_MESSAGES: QueuedComposerMessage[] = [];
@@ -7015,6 +7017,7 @@ export default function ChatView(props: ChatViewProps) {
     turnCount: number;
     messageId: MessageId;
     routeThreadKey: string;
+    restoreMessageCount: number;
   } | null>(null);
 
   if (pendingRevert && pendingRevert.routeThreadKey !== routeThreadKey) {
@@ -7027,6 +7030,19 @@ export default function ChatView(props: ChatViewProps) {
       if (!localApi || !activeThread || isRevertingCheckpoint) return;
       const message = activeThread.messages.find((message) => message.id === messageId);
       if (!message || message.role !== "user") return;
+      let messagesToRestore: ReadonlyArray<ChatMessage>;
+      try {
+        messagesToRestore = historyEditMessages(activeThread.messages, messageId, {
+          hasOlderTurns: threadHasOlderTurns(routeThreadState),
+        });
+      } catch (error) {
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Could not restore this turn's prompts.",
+        );
+        return;
+      }
+      if (messagesToRestore.length === 0) return;
 
       if (!supportsConversationRollback) {
         setThreadError(
@@ -7047,7 +7063,12 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
       if (restoreFiles === undefined) {
-        setPendingRevert({ turnCount, messageId, routeThreadKey });
+        setPendingRevert({
+          turnCount,
+          messageId,
+          routeThreadKey,
+          restoreMessageCount: messagesToRestore.length,
+        });
         return;
       }
 
@@ -7061,22 +7082,44 @@ export default function ChatView(props: ChatViewProps) {
         }
         const connection = readPreparedConnection(environmentId);
         if (!connection) throw new Error("The environment is not connected.");
-        const files = await prepareRevertedMessageAttachments({
-          message,
-          environmentId,
-          httpBaseUrl: connection.httpBaseUrl,
-          createAssetUrl: createAttachmentAssetUrl,
-        });
         const store = useComposerDraftStore.getState();
         const draft = store.getComposerDraft(composerDraftTarget);
+        const attachments = messagesToRestore.flatMap((entry) => entry.attachments ?? []);
         if (
-          (draft?.images.length ?? 0) + (draft?.files.length ?? 0) + files.length >
+          (draft?.images.length ?? 0) + (draft?.files.length ?? 0) + attachments.length >
           PROVIDER_SEND_TURN_MAX_ATTACHMENTS
         ) {
           throw new Error(
             "Make room for this message's attachments in the composer before rewinding.",
           );
         }
+        const files = await prepareRevertedMessageAttachments({
+          message: { ...message, attachments },
+          environmentId,
+          httpBaseUrl: connection.httpBaseUrl,
+          createAssetUrl: createAttachmentAssetUrl,
+        });
+        // Downloads can outlast a new attachment or terminal selection from another panel.
+        const latestDraft = store.getComposerDraft(composerDraftTarget);
+        if (composerRef.current?.hasPendingAttachments()) {
+          throw new Error("Wait for attachments to finish preparing before rewinding.");
+        }
+        if (
+          (latestDraft?.images.length ?? 0) +
+            (latestDraft?.files.length ?? 0) +
+            attachments.length >
+          PROVIDER_SEND_TURN_MAX_ATTACHMENTS
+        ) {
+          throw new Error(
+            "Make room for this message's attachments in the composer before rewinding.",
+          );
+        }
+        const restoration = prepareHistoryEdit({
+          messages: messagesToRestore,
+          threadId: activeThread.id,
+          terminalContexts: latestDraft?.terminalContexts ?? [],
+          createId: randomUUID,
+        });
         await waitForRevertedMessage(routeThreadRef, messageId, turnCount, async () => {
           const result = await revertThreadCheckpoint({
             environmentId,
@@ -7085,7 +7128,7 @@ export default function ChatView(props: ChatViewProps) {
           if (result._tag === "Failure") throw squashAtomCommandFailure(result);
         });
         const currentPrompt = store.getComposerDraft(composerDraftTarget)?.prompt ?? "";
-        const restoredPrompt = recallableComposerPrompt(message.text);
+        const restoredPrompt = restoration.prompt;
         const nextPrompt =
           restoredPrompt.length === 0
             ? currentPrompt
@@ -7093,24 +7136,35 @@ export default function ChatView(props: ChatViewProps) {
               ? `${currentPrompt}\n\n${restoredPrompt}`
               : restoredPrompt;
         store.setPrompt(composerDraftTarget, nextPrompt);
+        store.addTerminalContexts(composerDraftTarget, restoration.terminalContexts, {
+          appendReference: false,
+        });
+        for (const annotation of restoration.previewAnnotations) {
+          store.addPreviewAnnotation(composerDraftTarget, annotation, { appendReference: false });
+        }
+        for (const comment of restoration.reviewComments) {
+          store.addReviewComment(composerDraftTarget, comment, { appendReference: false });
+        }
         const images: ComposerImageAttachment[] = [];
         const restoredFiles: ComposerFileAttachment[] = [];
         files.forEach((file, index) => {
-          const attachment = {
-            id: randomUUID(),
-            name: file.name,
-            mimeType: file.type,
-            sizeBytes: file.size,
+          const attachment = restoreHistoryEditAttachment(
+            attachments[index]!,
             file,
-          };
-          if (message.attachments?.[index]?.type === "image") {
-            images.push({ ...attachment, type: "image", previewUrl: URL.createObjectURL(file) });
+            restoration.attachmentIds[index]!,
+            (image) => URL.createObjectURL(image),
+          );
+          if (attachment.type === "image") {
+            images.push(attachment);
           } else {
-            restoredFiles.push({ ...attachment, type: "file" });
+            restoredFiles.push(attachment);
           }
         });
         store.addImages(composerDraftTarget, images, { allowDuplicates: true });
-        store.addFiles(composerDraftTarget, restoredFiles, { allowDuplicates: true });
+        store.addFiles(composerDraftTarget, restoredFiles, {
+          allowDuplicates: true,
+          appendReference: false,
+        });
         if (currentRouteThreadKeyRef.current === routeThreadKey) {
           promptRef.current = nextPrompt;
           composerRef.current?.resetCursorState({ prompt: nextPrompt, cursor: nextPrompt.length });
@@ -7147,6 +7201,7 @@ export default function ChatView(props: ChatViewProps) {
       revertThreadCheckpoint,
       routeThreadKey,
       routeThreadRef,
+      routeThreadState,
       setThreadError,
       supportsConversationRollback,
     ],
@@ -10438,10 +10493,15 @@ export default function ChatView(props: ChatViewProps) {
       >
         <AlertDialogPopup>
           <AlertDialogHeader>
-            <AlertDialogTitle>Edit from here?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {(pendingRevert?.restoreMessageCount ?? 0) > 1
+                ? "Edit this turn?"
+                : "Edit from here?"}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              Rewind chat to before this message. Your prompt and attachments return to the
-              composer.
+              {(pendingRevert?.restoreMessageCount ?? 0) > 1
+                ? "This follow-up was sent while the agent was working. Editing restarts the whole turn and removes its replies and all later messages. Your prompts and attachments return to the composer, from the start of the turn through this follow-up."
+                : "Rewind chat to before this message. Your prompt and attachments return to the composer."}
               {activeWorktreePath === null
                 ? " Files stay as they are because this thread shares the project directory."
                 : null}

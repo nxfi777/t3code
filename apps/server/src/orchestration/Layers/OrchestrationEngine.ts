@@ -32,6 +32,8 @@ import {
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import {
   isOrchestrationCommandRejection,
   OrchestrationCommandIdConflictError,
@@ -84,6 +86,7 @@ function commandToAggregateRef(command: OrchestrationCommand): {
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const eventStore = yield* OrchestrationEventStore;
+  const projectionTurns = yield* ProjectionTurnRepository;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -242,9 +245,58 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           envelope.command.type === "thread.user-input.dismiss"
             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
             : Option.none();
+        // Accepted sends can outlive the command model's retained message
+        // window. Read their durable identity under the same dispatch lock.
+        const acceptedUserMessage =
+          envelope.command.type === "thread.message.user.bind-turn"
+            ? yield* projectionSnapshotQuery.getTurnStartMessage(envelope.command)
+            : Option.none();
+        let reconcileAcceptedPendingTurnStart = false;
+        if (envelope.command.type === "thread.message.user.bind-turn") {
+          const pending = yield* projectionTurns.getPendingTurnStartByThreadId(envelope.command);
+          if (Option.isSome(pending) && pending.value.messageId === envelope.command.messageId) {
+            const nativeTurn = yield* projectionTurns.getByTurnId(envelope.command);
+            reconcileAcceptedPendingTurnStart = Option.isSome(nativeTurn);
+          }
+        }
+        if (
+          envelope.command.type === "thread.message.user.bind-turn" &&
+          envelope.command.verifiedHistory !== undefined
+        ) {
+          const command = envelope.command;
+          const thread = commandReadModel.threads.find((entry) => entry.id === command.threadId);
+          const turns = yield* projectionTurns.listByThreadId({ threadId: command.threadId });
+          if (
+            !thread ||
+            thread.archivedAt !== null ||
+            thread.session?.activeTurnId != null ||
+            thread.session?.status === "running" ||
+            thread.session?.status === "starting" ||
+            thread.latestTurn?.state === "running" ||
+            turns.filter((turn) => turn.turnId === command.turnId && turn.completedAt !== null)
+              .length !== 1 ||
+            turns.some(
+              (turn) =>
+                (turn.turnId === null &&
+                  !(
+                    reconcileAcceptedPendingTurnStart && turn.pendingMessageId === command.messageId
+                  )) ||
+                (turn.turnId !== null && (turn.state === "pending" || turn.state === "running")),
+            )
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Historical user-turn membership changed before it could be verified.",
+            });
+          }
+        }
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
+          reconcileAcceptedPendingTurnStart,
+          ...(Option.isSome(acceptedUserMessage)
+            ? { acceptedUserMessage: acceptedUserMessage.value.message }
+            : {}),
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),
@@ -287,6 +339,24 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
               const lastSavedEvent = committedEvents.at(-1) ?? null;
               if (lastSavedEvent === null) {
+                if (envelope.command.type === "thread.message.user.bind-turn") {
+                  // A second native acknowledgement of the same association
+                  // is successful without replaying user activity to clients.
+                  yield* commandReceiptRepository.upsert({
+                    commandId: envelope.command.commandId,
+                    ...aggregateRef,
+                    acceptedAt: commandReadModel.updatedAt,
+                    resultSequence: commandReadModel.snapshotSequence,
+                    status: "accepted",
+                    error: null,
+                  });
+                  return {
+                    committedEvents,
+                    attachmentCleanups,
+                    lastSequence: commandReadModel.snapshotSequence,
+                    nextCommandReadModel,
+                  } as const;
+                }
                 return yield* new OrchestrationCommandInvariantError({
                   commandType: envelope.command.type,
                   detail: "Command produced no events.",
@@ -470,4 +540,4 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
-);
+).pipe(Layer.provide(ProjectionTurnRepositoryLive));

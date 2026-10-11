@@ -8,6 +8,7 @@ import {
   isImportedAgentSessionMessageId,
   type OrchestrationCommand,
   type OrchestrationEvent,
+  type OrchestrationMessage,
   type OrchestrationReadModel,
   type OrchestrationThread,
   type ThreadPullRequestKey,
@@ -212,10 +213,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   command,
   readModel,
   userInputActivity,
+  acceptedUserMessage,
+  reconcileAcceptedPendingTurnStart,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
   readonly userInputActivity?: OrchestrationThreadActivity;
+  readonly acceptedUserMessage?: OrchestrationMessage;
+  readonly reconcileAcceptedPendingTurnStart?: boolean;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
   OrchestrationCommandRejection | PlatformError.PlatformError,
@@ -1561,6 +1566,50 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           streaming: false,
           createdAt: command.createdAt,
           updatedAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.message.user.bind-turn": {
+      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+      const message =
+        acceptedUserMessage ?? thread.messages.find((entry) => entry.id === command.messageId);
+      if (
+        !message ||
+        message.id !== command.messageId ||
+        (command.verifiedHistory !== undefined && message.text !== command.verifiedHistory.text) ||
+        message.role !== "user" ||
+        message.streaming ||
+        isImportedAgentSessionMessageId(command.messageId) ||
+        (message.turnId !== null && message.turnId !== command.turnId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Message '${command.messageId}' cannot be associated with turn '${command.turnId}'.`,
+        });
+      }
+      if (message.turnId === command.turnId && !reconcileAcceptedPendingTurnStart) return [];
+      // This is an acknowledgement, not another send. Reuse the established
+      // message event without changing its position, timestamps or thread recency.
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: thread.updatedAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.message-sent",
+        payload: {
+          threadId: command.threadId,
+          messageId: message.id,
+          role: "user",
+          text: message.text,
+          ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+          ...(message.context !== undefined ? { context: message.context } : {}),
+          turnId: command.turnId,
+          streaming: false,
+          createdAt: message.createdAt,
+          updatedAt: message.updatedAt,
         },
       };
     }

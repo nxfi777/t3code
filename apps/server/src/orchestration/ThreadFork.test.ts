@@ -326,6 +326,64 @@ it.effect.each(["ordinary", "queued-later-prompt"] as const)(
     }),
 );
 
+it.effect.each(["primary", "steering"] as const)(
+  "forks the whole native turn from its verified %s message without changing the primary",
+  (selected) =>
+    Effect.gen(function* () {
+      const original = source();
+      const steering = {
+        ...original.messages[0]!,
+        id: MessageId.make("steering"),
+        text: "Also remember GAMMA",
+        createdAt: "2026-10-09T01:00:02.000Z",
+      };
+      const expectedTexts = ["Remember ALPHA", "ALPHA saved", steering.text];
+      const h = harness({
+        source: {
+          ...original,
+          messages: [...original.messages.slice(0, 2), steering, ...original.messages.slice(2)],
+        },
+        expectedTexts,
+        prepareTurns: (turns) => {
+          expect(turns[0]?.pendingMessageId).toBe("user1");
+          return turns;
+        },
+      });
+      yield* Effect.flatMap(ThreadFork.ThreadFork, (service) =>
+        service.fork({
+          threadId: sourceId,
+          targetThreadId: targetId,
+          messageId: MessageId.make(selected === "primary" ? "user1" : "steering"),
+        }),
+      ).pipe(Effect.provide(h.layer));
+      expect(
+        h
+          .model()
+          .threads.find((thread) => thread.id === targetId)
+          ?.messages.map((message) => message.text),
+      ).toEqual(expectedTexts);
+      expect(h.model().threads.find((thread) => thread.id === sourceId)).toEqual(h.original);
+      expect(h.forkCalls()).toBe(1);
+    }),
+);
+
+it.effect("rejects a stored membership that contradicts the persisted primary prompt", () =>
+  Effect.gen(function* () {
+    const original = source();
+    const h = harness({
+      source: {
+        ...original,
+        messages: original.messages.map((message) =>
+          message.id === "user1" ? { ...message, turnId: TurnId.make("turn2") } : message,
+        ),
+      },
+    });
+    yield* forkUser.pipe(Effect.provide(h.layer), Effect.flip);
+    expect(h.forkCalls()).toBe(0);
+    expect(h.model().threads).toEqual([h.original]);
+  }),
+);
+
 it.effect.each([
   "duplicate-users",
   "duplicate-turns",
@@ -334,7 +392,13 @@ it.effect.each([
   "conflicting-turn-id",
 ] as const)("rejects unsafe user-turn associations before any child or native fork: %s", (reason) =>
   Effect.gen(function* () {
-    const original = interruptedSource();
+    const interrupted = interruptedSource();
+    const original = {
+      ...interrupted,
+      messages: interrupted.messages.map((message) =>
+        message.role === "user" ? { ...message, turnId: null } : message,
+      ),
+    };
     const h = harness({
       source:
         reason === "duplicate-users"
