@@ -1,5 +1,6 @@
 import { forkSession, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import * as Schema from "effect/Schema";
+import { forkClaudeHistory } from "./claudeHistoryFork.ts";
 
 // A separate process gives SDK history helpers the provider's environment without
 // mutating the server's environment. `claude-history-worker.ts` is the
@@ -14,6 +15,8 @@ const decodeHistoryOptions = Schema.decodeSync(
       dir: Schema.optionalKey(Schema.String),
       includeSystemMessages: Schema.optionalKey(Schema.Boolean),
       upToMessageId: Schema.optionalKey(Schema.String),
+      retainedTurnStartMessageIds: Schema.optionalKey(Schema.Array(Schema.String)),
+      firstRemovedTurnStartMessageId: Schema.optionalKey(Schema.String),
     }),
   ),
 );
@@ -30,8 +33,13 @@ export async function runClaudeHistoryWorker(
       ? await getSessionMessages(sessionId, options)
       : method === "forkSession"
         ? await forkSession(sessionId, options)
-        : (() => {
-            throw new Error("Unknown Claude history operation.");
-          })();
+        : method === "forkAtTurnBoundary" && options.retainedTurnStartMessageIds !== undefined
+          ? await forkClaudeHistory(sessionId, {
+              ...options,
+              retainedTurnStartMessageIds: options.retainedTurnStartMessageIds,
+            })
+          : (() => {
+              throw new Error("Unknown Claude history operation.");
+            })();
   process.stdout.write(JSON.stringify(result));
 }

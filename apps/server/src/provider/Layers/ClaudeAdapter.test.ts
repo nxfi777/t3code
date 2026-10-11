@@ -176,6 +176,7 @@ function makeHarness(config?: {
   readonly environment?: ClaudeAdapterLiveOptions["environment"];
   readonly getSessionMessages?: ClaudeAdapterLiveOptions["getSessionMessages"];
   readonly forkSession?: ClaudeAdapterLiveOptions["forkSession"];
+  readonly forkAtTurnBoundary?: ClaudeAdapterLiveOptions["forkAtTurnBoundary"];
 }) {
   const query = new FakeClaudeQuery();
   const queries = [query];
@@ -193,8 +194,10 @@ function makeHarness(config?: {
     modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
     ...(config?.getSessionMessages ? { getSessionMessages: config.getSessionMessages } : {}),
     ...(config?.forkSession ? { forkSession: config.forkSession } : {}),
+    ...(config?.forkAtTurnBoundary ? { forkAtTurnBoundary: config.forkAtTurnBoundary } : {}),
     createQuery: (input) => {
-      if (createInput && config?.getSessionMessages) queries.push(new FakeClaudeQuery());
+      if (createInput && (config?.getSessionMessages || config?.forkAtTurnBoundary))
+        queries.push(new FakeClaudeQuery());
       createInput = input;
       return queries.at(-1)!;
     },
@@ -7420,6 +7423,68 @@ describe("ClaudeAdapterLive", () => {
       Effect.provide(harness.layer),
     );
   });
+
+  for (const reject of [false, true]) {
+    it.effect(
+      `uses verified native history before restarting a compacted Claude turn: reject=${reject}`,
+      () => {
+        const calls: Array<
+          Parameters<NonNullable<ClaudeAdapterLiveOptions["forkAtTurnBoundary"]>>
+        > = [];
+        const harness = makeHarness({
+          forkAtTurnBoundary: async (...args) => {
+            calls.push(args);
+            if (reject) throw new Error("Compacted history proof failed");
+            return {
+              sessionId: CLAUDE_FORK_SESSION_ID,
+              turnStartMessageIds: ["mapped-native-primary"],
+            };
+          },
+        });
+        return Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const session = yield* adapter.startSession({
+            threadId: THREAD_ID,
+            provider: ProviderDriverKind.make("claudeAgent"),
+            runtimeMode: "full-access",
+          });
+          const first = yield* sendCompletedClaudeTurn(adapter, harness, session.threadId, "first");
+          const second = yield* sendCompletedClaudeTurn(
+            adapter,
+            harness,
+            session.threadId,
+            "second",
+          );
+          const before = (yield* adapter.listSessions())[0]?.resumeCursor;
+          if (reject) {
+            const error = yield* adapter.rollbackThread(session.threadId, 1).pipe(Effect.flip);
+            assert.equal(error._tag, "ProviderAdapterRequestError");
+            if (error._tag !== "ProviderAdapterRequestError") throw error;
+            assert.match(String(error.cause), /Compacted history proof failed/);
+            assert.equal(harness.queries.length, 1);
+            assert.equal(harness.queries[0]?.closeCalls, 0);
+            assert.deepEqual((yield* adapter.listSessions())[0]?.resumeCursor, before);
+          } else {
+            const snapshot = yield* adapter.rollbackThread(session.threadId, 1);
+            assert.equal(snapshot.turns.length, 1);
+            assert.equal(harness.queries[0]?.closeCalls, 1);
+            assert.deepEqual((yield* adapter.listSessions())[0]?.resumeCursor, {
+              threadId: session.threadId,
+              resume: CLAUDE_FORK_SESSION_ID,
+              turnCount: 1,
+              turnStartMessageIds: ["mapped-native-primary"],
+            });
+          }
+          assert.equal(calls.length, 1);
+          assert.deepEqual(calls[0]?.[1].retainedTurnStartMessageIds, [first.turnId]);
+          assert.equal(calls[0]?.[1].firstRemovedTurnStartMessageId, second.turnId);
+        }).pipe(
+          Effect.provideService(Random.Random, makeDeterministicRandomService()),
+          Effect.provide(harness.layer),
+        );
+      },
+    );
+  }
 
   it.effect("rejects a Claude fork that drops a retained user turn", () => {
     let firstTurnId = "";
