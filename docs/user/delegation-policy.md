@@ -11,13 +11,15 @@ The command updates the native Claude Code and Codex settings that T3 uses. Thes
 
 ## The three roles
 
-| Role     | Use                                                                   | Claude default        | Codex default              |
-| -------- | --------------------------------------------------------------------- | --------------------- | -------------------------- |
-| `scan`   | Find files, extract facts, make simple checks                         | Haiku, low effort     | GPT-6 Luna, high effort    |
-| `work`   | Implement a scoped change and test it                                 | Sonnet, medium effort | GPT-6.1 Sol, medium effort |
-| `review` | Diagnose difficult bugs, assess designs, review consequential changes | Opus, high effort     | GPT-6 Astra, high effort   |
+| Role     | Use                                                              | Claude default        | Codex default              |
+| -------- | ---------------------------------------------------------------- | --------------------- | -------------------------- |
+| `scan`   | Find files, extract facts, make simple checks                    | Haiku, low effort     | GPT-6 Luna, high effort    |
+| `work`   | Routine implementation and focused tests                         | Sonnet, medium effort | GPT-6.1 Sol, medium effort |
+| `review` | Expert advice, difficult implementation and consequential review | Opus, high effort     | GPT-6 Astra, high effort   |
 
-The parent chooses a role based on the task and checks the result. It gives routine workers a focused brief. Forks that need the entire conversation can still inherit the parent's model. Tiny tasks should stay with the parent.
+The parent chooses by difficulty, uncertainty and risk. Sonnet and Sol handle well-understood implementation. Opus and Astra advise on substantial plans, architectural choices and persistent failures; they also implement changes that need deeper reasoning. The `review` key selects that expert model for both uses. An advice-only task stays read-only, while an implementation brief authorizes the expert to edit and test.
+
+The parent checks the result and gives workers focused briefs. A parent already using the expert model can handle hard work directly. Forks that need the entire conversation can still inherit the parent's model. Tiny tasks should stay with the parent.
 
 `default_role` supplies the model for a worker whose model was not specified. Explicit task choices can override it. This is a delegation policy, not a spending cap or a guarantee that every model decision follows the table.
 
@@ -36,7 +38,7 @@ t3-delegation check
 
 ## Claude's advisor
 
-`claude.advisor_model` is separate from the worker roles. It starts as `null`, which removes the saved advisor setting. Set it to `"opus"` and apply to let compatible Claude sessions and subagents consult an Opus advisor at decision points. This does not switch your main model.
+`claude.advisor_model` is separate from the worker roles. The supplied policy sets it to `"opus"`, so compatible Claude sessions and subagents can consult an Opus advisor at decision points. Set it to `null` and apply to remove that saved advisor setting. This does not switch your main model. Codex uses the configured `review` agent for expert advice.
 
 Advisor calls use additional tokens and receive the conversation so far. Claude decides when to consult it. The feature requires a supported Claude Code release, account access and a compatible model pairing. See [Claude's advisor documentation](https://code.claude.com/docs/en/advisor).
 
