@@ -10,7 +10,7 @@
   },
   "claude": {
     "default_role": "work",
-    "advisor_model": null,
+    "advisor_model": "opus",
     "roles": {
       "scan": { "model": "haiku", "effort": "low" },
       "work": { "model": "sonnet", "effort": "medium" },
