@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "codex": {
+    "default_role": "work",
+    "roles": {
+      "scan": { "model": "gpt-6-luna", "effort": "high" },
+      "work": { "model": "gpt-6.1-sol", "effort": "medium" },
+      "review": { "model": "gpt-6-astra", "effort": "high" }
+    }
+  },
+  "claude": {
+    "default_role": "work",
+    "advisor_model": null,
+    "roles": {
+      "scan": { "model": "haiku", "effort": "low" },
+      "work": { "model": "sonnet", "effort": "medium" },
+      "review": { "model": "opus", "effort": "high" }
+    }
+  }
+}
