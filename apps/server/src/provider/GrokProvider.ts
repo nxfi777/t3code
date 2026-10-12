@@ -44,6 +44,7 @@ import {
 } from "./acp/GrokAcpSupport.ts";
 import { sessionModelStateFromInitialize } from "./acp/AcpRuntimeModel.ts";
 import { discoverGrokSkills } from "./Drivers/GrokSkills.ts";
+import { probeGrokHistoryExtensions } from "./acp/GrokAcpHistory.ts";
 
 const GROK_PRESENTATION = {
   displayName: "Grok",
@@ -367,6 +368,7 @@ const discoverGrokMetadataViaAcpInitialize = (
     return {
       models: buildGrokModelsFromSessionModelState(sessionModelStateFromInitialize(initialized)),
       slashCommands: grokSlashCommandsFromInitialize(initialized),
+      supportsConversationRollback: yield* probeGrokHistoryExtensions(acp),
     };
   }).pipe(Effect.scoped);
 
@@ -540,7 +542,10 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
   }
 
   return buildServerProvider({
-    presentation: GROK_PRESENTATION,
+    presentation: {
+      ...GROK_PRESENTATION,
+      supportsConversationRollback: acpMetadata?.supportsConversationRollback === true,
+    },
     enabled: grokSettings.enabled,
     checkedAt,
     models,

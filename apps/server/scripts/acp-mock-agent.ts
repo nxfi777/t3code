@@ -93,6 +93,10 @@ const emitStaleXAiPromptCompleteBeforeSecondHang =
 const emitOverlappingXAiPromptCompleteOutOfOrder =
   process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
+const grokNativeHistory = process.env.T3_ACP_GROK_NATIVE_HISTORY === "1";
+const grokPromptCounts = new Map<string, number>();
+const grokInitialPromptCount = Number(process.env.T3_ACP_GROK_INITIAL_PROMPT_COUNT ?? "0");
+let grokForkCount = 0;
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const omitModelConfigOption = process.env.T3_ACP_OMIT_MODEL_CONFIG_OPTION === "1";
@@ -873,6 +877,27 @@ const program = Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       beginAcpMockPrompt(cancelledSessions, requestedSessionId);
       promptCount += 1;
+      if (grokNativeHistory) {
+        const promptIndex = grokPromptCounts.get(requestedSessionId) ?? grokInitialPromptCount;
+        grokPromptCounts.set(requestedSessionId, promptIndex + 1);
+        if (process.env.T3_ACP_GROK_NO_USER_ECHO !== "1")
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "user_message_chunk",
+              content: request.prompt[0] ?? { type: "text", text: "native user prompt" },
+              _meta: { promptIndex },
+            },
+          });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `Reply to native prompt ${promptIndex}` },
+          },
+        });
+        return yield* finishPrompt(requestedSessionId, "end_turn");
+      }
       if (
         process.env.T3_ACP_CRASH_PROMPT === "1" &&
         request.prompt.some((part) => part.type === "text" && part.text === "crash now")
@@ -2325,6 +2350,57 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
+    if (
+      grokNativeHistory &&
+      ["_x.ai/rewind/points", "_x.ai/rewind/execute", "_x.ai/session/fork"].includes(method)
+    ) {
+      const value = params as Record<string, unknown>;
+      const sourceSessionId =
+        method === "_x.ai/session/fork" ? value.sourceSessionId : value.session_id;
+      if (typeof sourceSessionId !== "string") {
+        return Effect.fail(
+          new AcpError.AcpRequestError({ code: -32602, errorMessage: "Missing session id" }),
+        );
+      }
+      const count = grokPromptCounts.get(sourceSessionId) ?? grokInitialPromptCount;
+      if (method === "_x.ai/rewind/points") {
+        return Effect.succeed({
+          rewind_points: Array.from({ length: count }, (_, prompt_index) => ({ prompt_index })),
+        });
+      }
+      const target =
+        method === "_x.ai/session/fork" ? value.targetPromptIndex : value.target_prompt_index;
+      if (
+        typeof target !== "number" ||
+        !Number.isInteger(target) ||
+        target < 0 ||
+        target >= count
+      ) {
+        return Effect.fail(
+          new AcpError.AcpRequestError({ code: -32602, errorMessage: "Invalid prompt index" }),
+        );
+      }
+      if (method === "_x.ai/session/fork") {
+        const newSessionId = `${sourceSessionId}-native-fork-${++grokForkCount}`;
+        grokPromptCounts.set(newSessionId, target + 1);
+        return Effect.succeed({ newSessionId, parentSessionId: sourceSessionId });
+      }
+      if (value.mode !== "conversation_only") {
+        return Effect.fail(
+          new AcpError.AcpRequestError({
+            code: -32602,
+            errorMessage: "Expected conversation-only rewind",
+          }),
+        );
+      }
+      // Native Grok previews without mutation unless force selects commit mode.
+      if (value.force === true) grokPromptCounts.set(sourceSessionId, target);
+      return Effect.succeed({
+        success: value.force === true,
+        target_prompt_index: target,
+        mode: "conversation_only",
+      });
+    }
     if (method === "_test/environment") {
       return Effect.succeed({
         inherited: process.env.T3_ACP_RUNTIME_AMBIENT === "sentinel",

@@ -603,11 +603,21 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
         if (message.exit._tag === "Success") {
           return completeExtPendingSuccess(message.requestId, message.exit.value);
         }
-        const failure = message.exit.cause.find((entry) => entry._tag === "Fail");
-        if (failure && isProtocolError(failure.error)) {
+        // Plain JSON-RPC errors are decoded as Die by Effect's RPC serializer;
+        // Effect peers may instead send a Cause containing Fail.
+        const failure = message.exit.cause.find(
+          (entry) => entry._tag === "Fail" || entry._tag === "Die",
+        );
+        const protocolError =
+          failure?._tag === "Fail"
+            ? failure.error
+            : failure?._tag === "Die"
+              ? failure.defect
+              : undefined;
+        if (isProtocolError(protocolError)) {
           return completeExtPendingFailure(
             message.requestId,
-            AcpError.AcpRequestError.fromProtocolError(failure.error, {
+            AcpError.AcpRequestError.fromProtocolError(protocolError, {
               method: pendingRequest.method,
               requestId: message.requestId,
               cause: message.exit.cause,
