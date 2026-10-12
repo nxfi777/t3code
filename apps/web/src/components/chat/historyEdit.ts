@@ -66,7 +66,7 @@ export function historyEditMessages(
       )
   ) {
     throw new Error(
-      "T3 cannot restore this turn while earlier prompts are unlinked. Copy them into a new message instead.",
+      "T3 is missing saved turn information for an earlier message. Reload this chat and try again. Your conversation has not changed.",
     );
   }
   return messages

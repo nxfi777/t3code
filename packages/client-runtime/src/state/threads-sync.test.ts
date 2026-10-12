@@ -378,12 +378,52 @@ const deleted = (): OrchestrationThreadStreamItem => ({
   },
 });
 
+const turnCompleted = (
+  turnId: TurnId,
+  sequence: number,
+  checkpointTurnCount = 1,
+): Extract<OrchestrationThreadStreamItem, { kind: "event" }> => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make(`checkpoint-${sequence}`),
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    sequence,
+    occurredAt: "2026-04-01T00:00:05.000Z",
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.turn-diff-completed",
+    payload: {
+      threadId: THREAD_ID,
+      turnId,
+      checkpointTurnCount,
+      checkpointRef: CheckpointRef.make(`ref-${turnId}`),
+      status: "missing",
+      files: [],
+      assistantMessageId: MessageId.make(`assistant:${turnId}`),
+      completedAt: "2026-04-01T00:00:05.000Z",
+    },
+  },
+});
+
 describe("EnvironmentThreads", () => {
-  it.effect.each(["exact", "ambiguous", "imported", "retry-none", "retry-stale"] as const)(
+  it.effect.each([
+    "exact",
+    "ambiguous",
+    "imported",
+    "retry-none",
+    "retry-stale",
+    "later-background",
+    "accepted-steering",
+  ] as const)(
     "resolves completed primary prompts without reload or blocking live events: %s",
     (mode) =>
       Effect.gen(function* () {
         const turnId = TurnId.make("silent-turn");
+        const completedTurnId =
+          mode === "later-background" ? TurnId.make("background-turn") : turnId;
         const user = {
           id: MessageId.make(mode === "imported" ? "import:fork:old:0" : "silent-user"),
           role: "user" as const,
@@ -393,11 +433,31 @@ describe("EnvironmentThreads", () => {
           createdAt: "2026-04-01T00:00:00.000Z",
           updatedAt: "2026-04-01T00:00:00.000Z",
         };
+        const steering = {
+          ...user,
+          id: MessageId.make("accepted-steering"),
+          turnId,
+          text: "Follow up",
+        };
         const cached: OrchestrationThread = {
           ...BASE_THREAD,
-          messages: [user],
+          messages: mode === "accepted-steering" ? [user, steering] : [user],
+          checkpoints:
+            mode === "later-background"
+              ? [
+                  {
+                    turnId,
+                    checkpointTurnCount: 1,
+                    checkpointRef: CheckpointRef.make("ref-silent"),
+                    status: "missing",
+                    files: [],
+                    assistantMessageId: MessageId.make("assistant:silent-turn"),
+                    completedAt: "2026-04-01T00:00:02.000Z",
+                  },
+                ]
+              : [],
           latestTurn: {
-            turnId,
+            turnId: completedTurnId,
             state: "interrupted",
             requestedAt: "2026-04-01T00:00:03.000Z",
             startedAt: "2026-04-01T00:00:03.000Z",
@@ -409,7 +469,11 @@ describe("EnvironmentThreads", () => {
         const started = yield* Deferred.make<void>();
         const response = yield* Deferred.make<Option.Option<OrchestrationThreadDetailSnapshot>>();
         const retries = mode === "retry-none" || mode === "retry-stale";
-        const resolves = mode === "exact" || retries;
+        const resolves =
+          mode === "exact" ||
+          retries ||
+          mode === "later-background" ||
+          mode === "accepted-steering";
         let attempts = 0;
         const harness = yield* makeHarness({
           cached,
@@ -427,31 +491,7 @@ describe("EnvironmentThreads", () => {
           }),
         });
         yield* awaitThreadState(harness.observed, (value) => value.status === "live");
-        const checkpoint: Extract<OrchestrationThreadStreamItem, { kind: "event" }> = {
-          kind: "event",
-          event: {
-            eventId: EventId.make("silent-checkpoint"),
-            commandId: null,
-            causationEventId: null,
-            correlationId: null,
-            metadata: {},
-            sequence: 8,
-            occurredAt: "2026-04-01T00:00:05.000Z",
-            aggregateKind: "thread",
-            aggregateId: THREAD_ID,
-            type: "thread.turn-diff-completed",
-            payload: {
-              threadId: THREAD_ID,
-              turnId,
-              checkpointTurnCount: 1,
-              checkpointRef: CheckpointRef.make("ref-silent"),
-              status: "missing",
-              files: [],
-              assistantMessageId: MessageId.make("assistant:silent-turn"),
-              completedAt: "2026-04-01T00:00:05.000Z",
-            },
-          },
-        };
+        const checkpoint = turnCompleted(completedTurnId, 8, mode === "later-background" ? 2 : 1);
         yield* Queue.offer(harness.inputs, checkpoint);
         if (mode !== "imported") yield* Deferred.await(started);
         // HTTP remains parked while newer live events are processed.
@@ -474,7 +514,10 @@ describe("EnvironmentThreads", () => {
             thread: {
               ...cached,
               title: "Do not copy snapshot content",
-              messages: [{ ...user, turnId: resolves ? turnId : null }],
+              messages: [
+                { ...user, turnId: resolves ? turnId : null },
+                ...(mode === "accepted-steering" ? [steering] : []),
+              ],
             },
           }),
         );
@@ -492,9 +535,134 @@ describe("EnvironmentThreads", () => {
           ...user,
           turnId: resolves ? turnId : null,
         });
+        if (mode === "accepted-steering")
+          expect(Option.getOrThrow(final.data).messages[1]).toEqual(steering);
         expect(yield* Ref.get(harness.loaderCalls)).toBe(mode === "imported" ? 0 : retries ? 2 : 1);
       }),
   );
+  it.effect("merges only unique authoritative links to retained local turns", () =>
+    Effect.gen(function* () {
+      const turnId = TurnId.make("completed-turn");
+      const previousTurnId = TurnId.make("previous-turn");
+      const primary = {
+        id: MessageId.make("primary"),
+        role: "user" as const,
+        text: "Original prompt",
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-04-01T00:00:00.000Z",
+        updatedAt: "2026-04-01T00:00:00.000Z",
+      };
+      const otherMessages = [
+        { ...primary, id: MessageId.make("already-bound"), turnId: previousTurnId },
+        { ...primary, id: MessageId.make("import:fork:old:0") },
+        { ...primary, id: MessageId.make("duplicate") },
+        { ...primary, id: MessageId.make("not-retained") },
+        { ...primary, id: MessageId.make("unlinked") },
+        { ...primary, id: MessageId.make("assistant"), role: "assistant" as const },
+      ];
+      const cached = { ...BASE_THREAD, messages: [primary, ...otherMessages] };
+      const harness = yield* makeHarness({
+        cached,
+        httpSnapshot: Option.some({
+          snapshotSequence: 8,
+          thread: {
+            ...cached,
+            messages: [
+              { ...primary, turnId },
+              ...otherMessages.map((message) => ({
+                ...message,
+                turnId:
+                  message.id === "not-retained"
+                    ? TurnId.make("future-turn")
+                    : message.id === "unlinked"
+                      ? null
+                      : turnId,
+              })),
+              { ...primary, id: MessageId.make("duplicate"), turnId: previousTurnId },
+            ],
+          },
+        }),
+      });
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+      yield* Queue.offer(harness.inputs, turnCompleted(turnId, 8));
+      const final = yield* awaitThreadState(
+        harness.observed,
+        (value) => Option.isSome(value.data) && value.data.value.messages[0]?.turnId === turnId,
+      );
+      expect(Option.getOrThrow(final.data).messages).toEqual([
+        { ...primary, turnId },
+        ...otherMessages,
+      ]);
+    }),
+  );
+
+  it.effect.each(["snapshot", "revert"] as const)(
+    "discards an association response after a history-changing %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const turnId = TurnId.make("completed-turn");
+        const user = {
+          id: MessageId.make("primary"),
+          role: "user" as const,
+          text: "Original prompt",
+          turnId: null,
+          streaming: false,
+          createdAt: "2026-04-01T00:00:00.000Z",
+          updatedAt: "2026-04-01T00:00:00.000Z",
+        };
+        const cached = { ...BASE_THREAD, messages: [user] };
+        const started = yield* Deferred.make<void>();
+        const response = yield* Deferred.make<Option.Option<OrchestrationThreadDetailSnapshot>>();
+        const harness = yield* makeHarness({
+          cached,
+          snapshotLoad: Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Deferred.await(response)),
+          ),
+        });
+        yield* awaitThreadState(harness.observed, (value) => value.status === "live");
+        yield* Queue.offer(harness.inputs, turnCompleted(turnId, 8));
+        yield* Deferred.await(started);
+        const before = Option.getOrThrow(
+          (yield* awaitThreadState(
+            harness.observed,
+            (value) =>
+              Option.isSome(value.data) &&
+              value.data.value.checkpoints.some((checkpoint) => checkpoint.turnId === turnId),
+          )).data,
+        );
+        yield* Queue.offer(
+          harness.inputs,
+          mode === "snapshot"
+            ? { kind: "snapshot", snapshot: { snapshotSequence: 9, thread: before } }
+            : {
+                ...turnCompleted(turnId, 9),
+                event: {
+                  ...turnCompleted(turnId, 9).event,
+                  type: "thread.reverted",
+                  payload: { threadId: THREAD_ID, turnCount: 0 },
+                },
+              },
+        );
+        yield* Queue.offer(harness.inputs, titleUpdated("History replaced", 10));
+        yield* awaitThreadState(
+          harness.observed,
+          (value) => Option.isSome(value.data) && value.data.value.title === "History replaced",
+        );
+        yield* Deferred.succeed(
+          response,
+          Option.some({
+            snapshotSequence: 100,
+            thread: { ...before, messages: [{ ...user, turnId }] },
+          }),
+        );
+        yield* TestClock.adjust("1 millis");
+        const final = Option.getOrThrow((yield* Ref.get(harness.latest)).data);
+        expect(final.messages).toEqual(mode === "snapshot" ? [user] : []);
+        expect(final.title).toBe("History replaced");
+      }),
+  );
+
   for (const source of ["disk", "HTTP"] as const) {
     it.effect(`does not rewrite an unchanged ${source} snapshot on navigation or warm return`, () =>
       Effect.gen(function* () {

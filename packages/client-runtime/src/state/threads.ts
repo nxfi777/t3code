@@ -456,7 +456,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       primaryAssociationRequests.has(turnId) ||
       thread.session?.activeTurnId === turnId ||
       !thread.checkpoints.some((checkpoint) => checkpoint.turnId === turnId) ||
-      thread.messages.some((message) => message.role === "user" && message.turnId === turnId) ||
       !thread.messages.some(
         (message) =>
           message.role === "user" &&
@@ -475,8 +474,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     const supportsReasoning = yield* Ref.get(reasoningMessagesSupported);
     // Session events do not carry pendingMessageId, and their timestamps need
     // not equal the prompt's. Fetch the authoritative join once at completion.
-    // Merge only this association: keep loaded pages, content and event cursor,
-    // and never block the live event stream on an HTTP request.
+    // Merge associations for every loaded prompt, including earlier turns:
+    // a background turn may have no user, and one native turn can contain
+    // both its primary prompt and accepted steering messages. Keep loaded
+    // pages, content and event cursor; never block the stream on HTTP.
     yield* snapshotLoader
       .load(
         prepared.value,
@@ -498,22 +499,34 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
                 primaryAssociationRequests.delete(turnId);
                 return;
               }
-              const users = snapshot.value.thread.messages.filter(
-                (message) =>
-                  message.role === "user" &&
-                  message.turnId === turnId &&
-                  !isImportedAgentSessionMessageId(message.id),
-              );
-              if (users.length !== 1) return;
-              const primary = users[0]!;
               const current = yield* SubscriptionRef.get(state);
               if (Option.isNone(current.data)) return;
+              const associations = new Map<
+                string,
+                OrchestrationThread["messages"][number]["turnId"]
+              >();
+              for (const message of snapshot.value.thread.messages) {
+                if (message.role !== "user" || isImportedAgentSessionMessageId(message.id))
+                  continue;
+                // Never choose between duplicate message identities, even
+                // when their claimed turn associations happen to agree.
+                associations.set(message.id, associations.has(message.id) ? null : message.turnId);
+              }
+              const retainedTurnIds = new Set(
+                current.data.value.checkpoints.map((checkpoint) => checkpoint.turnId),
+              );
               let changed = false;
               const messages = current.data.value.messages.map((message) => {
-                if (message.id !== primary.id || message.role !== "user" || message.turnId !== null)
+                if (
+                  message.role !== "user" ||
+                  message.turnId !== null ||
+                  isImportedAgentSessionMessageId(message.id)
+                )
                   return message;
+                const associatedTurnId = associations.get(message.id);
+                if (!associatedTurnId || !retainedTurnIds.has(associatedTurnId)) return message;
                 changed = true;
-                return { ...message, turnId };
+                return { ...message, turnId: associatedTurnId };
               });
               if (changed) yield* setThread({ ...current.data.value, messages }, "keep");
             }),

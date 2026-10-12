@@ -36,7 +36,7 @@ afterEach(() => {
 });
 
 it.effect(
-  "reloads v4 thread snapshots while retaining other local data and v5 associations",
+  "reloads v5 thread snapshots while retaining other local data and v6 associations",
   () => {
     const stores = new Map<string, Map<unknown, unknown>>([
       ["settings", new Map([["theme", "dark"]])],
@@ -105,10 +105,10 @@ it.effect(
       expect(Option.getOrThrow(yield* cache.loadThread(environmentId, threadId))).toEqual(snapshot);
       const [key, encoded] = [...stores.get("thread")!.entries()][0]!;
       expect(typeof encoded).toBe("string");
-      expect(encoded).toContain('"schemaVersion":5');
+      expect(encoded).toContain('"schemaVersion":6');
       stores
         .get("thread")!
-        .set(key, (encoded as string).replace('"schemaVersion":5', '"schemaVersion":4'));
+        .set(key, (encoded as string).replace('"schemaVersion":6', '"schemaVersion":5'));
       const rejected = yield* cache.loadThread(environmentId, threadId).pipe(Effect.flip);
       expect(rejected.operation).toBe("load-thread");
       expect(stores.get("settings")?.get("theme")).toBe("dark");

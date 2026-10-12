@@ -70,8 +70,10 @@ const StoredShellSnapshotJson = Schema.fromJsonString(StoredShellSnapshot);
 // settled reasoning messages by resuming afterSequence.
 // v5 reloads primary user/turn associations for older silent turns. These
 // read-time associations do not advance the server event sequence.
+// v6 reloads associations missed when background turns or steering prompts
+// prevented the completion refresh from repairing earlier user messages.
 const StoredThreadSnapshot = Schema.Struct({
-  schemaVersion: Schema.Literal(5),
+  schemaVersion: Schema.Literal(6),
   environmentId: EnvironmentId,
   threadId: ThreadId,
   snapshot: OrchestrationThreadDetailSnapshot,
@@ -691,7 +693,7 @@ export const connectionStorageLayer = Layer.effectContext(
       saveThread: (environmentId, snapshot) =>
         Effect.gen(function* () {
           const encoded = yield* encodeStoredThreadSnapshot({
-            schemaVersion: 5,
+            schemaVersion: 6,
             environmentId,
             threadId: snapshot.thread.id,
             snapshot,

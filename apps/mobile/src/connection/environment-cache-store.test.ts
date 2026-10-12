@@ -130,7 +130,7 @@ describe("mobile SQLite environment cache store", () => {
         memory.values.set(
           id,
           JSON.stringify({
-            schemaVersion: 3,
+            schemaVersion: 4,
             environmentId: ENVIRONMENT_ID,
             threadId: snapshot.thread.id,
             snapshot: {

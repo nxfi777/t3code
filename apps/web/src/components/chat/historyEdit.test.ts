@@ -106,13 +106,13 @@ describe("whole-turn history editing", () => {
     ).toEqual([selected]);
     expect(() =>
       historyEditMessages([message("unlinked primary", null), selected], selected.id),
-    ).toThrow("earlier prompts are unlinked");
+    ).toThrow("missing saved turn information");
     expect(() =>
       historyEditMessages(
         [message("original", "turn"), message("unlinked answer", null), selected],
         selected.id,
       ),
-    ).toThrow("earlier prompts are unlinked");
+    ).toThrow("missing saved turn information");
   });
 
   it("preserves the entire plan and legacy context for both primary and follow-up edits", () => {
