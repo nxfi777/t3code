@@ -23,7 +23,9 @@ The parent chooses by difficulty, uncertainty and risk. Sonnet and Sol handle we
 
 The parent checks the result and gives workers focused briefs. A parent already using the expert model can handle hard work directly. Forks that need the entire conversation can still inherit the parent's model. Tiny tasks should stay with the parent.
 
-`default_role` supplies the model for a worker whose model was not specified. Explicit task choices can override it. This is a delegation policy, not a spending cap or a guarantee that every model decision follows the table.
+`default_role` supplies the model for a native harness worker whose model was not specified. Explicit task choices can override it. This is a delegation policy, not a spending cap or a guarantee that every model decision follows the table.
+
+T3 v0.1.0 also provides `delegate_task` for work across providers. That tool uses the provider, model and options passed to it, or inherits the parent selection when they are omitted. This updater does not set its defaults. For cross-provider work, inspect `orchestrator_capabilities` and pass the intended model explicitly to `delegate_task`; native role names alone do not route those tasks.
 
 ## What context agents receive
 

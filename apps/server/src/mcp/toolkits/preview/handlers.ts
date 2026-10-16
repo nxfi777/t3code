@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
+import type { PreviewDevtoolsInput } from "@t3tools/contracts";
+import * as Devtools from "../../../preview/Devtools.ts";
 import {
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   PREVIEW_RECORDING_STOP_TIMEOUT_MS,
@@ -189,7 +191,39 @@ export const claimPreviewRecording = Effect.fn("PreviewToolkit.claimRecording")(
   return { ...recording, id: finalId, path: finalPath };
 });
 
+const invokeDevtools = (input: PreviewDevtoolsInput) =>
+  Effect.gen(function* () {
+    const scope = yield* McpInvocationContext.requireThreadMcpCapability("preview");
+    const service = yield* Devtools.PreviewDevtools;
+    return { data: yield* service.invoke(scope, input) };
+  });
+
 const handlers = {
+  preview_console: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "console" }),
+  ),
+  preview_network: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "network" }),
+  ),
+  preview_network_request: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "request" }),
+  ),
+  preview_styles: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "styles" }),
+  ),
+  preview_emulate: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "emulate" }),
+  ),
+  preview_performance_start: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "traceStart" }),
+  ),
+  preview_performance_stop: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "traceStop" }),
+  ),
+  preview_memory: McpToolAccess.actsAsCaller((input) =>
+    invokeDevtools({ ...input, action: "memory" }),
+  ),
+
   preview_dialog: McpToolAccess.actsAsCaller((input) =>
     invokeTargeted<PreviewAutomationStatus>("dialog", input),
   ),

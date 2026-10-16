@@ -75,7 +75,7 @@ function makeSession(frame?: ReturnType<typeof makeFrame>) {
   const events = new NodeEvents.EventEmitter();
   return {
     on: vi.fn((name: string, listener: () => void) => events.on(name, listener)),
-    emit: (name: string) => events.emit(name),
+    emit: (name: string, ...args: unknown[]) => events.emit(name, ...args),
     detach: vi.fn(async () => {}),
     send: vi.fn(async (method: string, input?: unknown): Promise<Record<string, unknown>> => {
       if (method === "Page.getNavigationHistory") return { currentIndex: 0, entries: [{}] };
@@ -1645,6 +1645,78 @@ it.live("a desktop page that comes back reconnects without waiting for a viewer"
       // Without a viewer or agent, the server drives the page again, so its URL keeps reaching clients.
       while (desktopConnections.length < 2) yield* Effect.yieldNow;
       expect(desktopConnections).toHaveLength(2);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("keeps DevTools reads scoped and rejects foreign mutations", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      const cdp = contexts[0]!.sessions[0]!;
+      cdp.emit("Runtime.consoleAPICalled", {
+        type: "log",
+        args: [{ type: "string", value: "tab-specific message" }],
+        timestamp: 1,
+      });
+      yield* Effect.yieldNow;
+      const logs = yield* broker.invoke({
+        scope: asSession("agent-b"),
+        tabId,
+        operation: "devtools",
+        input: { action: "console" },
+      });
+      expect(logs).toMatchObject({ entries: [{ text: "tab-specific message" }] });
+      for (const action of ["emulate", "traceStart", "traceStop", "artifactDelete"]) {
+        const failure = yield* broker
+          .invoke({
+            scope: asSession("agent-b"),
+            tabId,
+            operation: "devtools",
+            input: { action, artifactId: "foreign", cpuRate: 4 },
+          })
+          .pipe(Effect.result);
+        expect(failure).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "PreviewAutomationControlInterruptedError",
+            reason: "agentMismatch",
+          },
+        });
+      }
+      yield* broker.invoke({
+        scope,
+        tabId,
+        operation: "devtools",
+        input: { action: "emulate", cpuRate: 4 },
+      });
+      expect(cdp.send).toHaveBeenCalledWith("Emulation.setCPUThrottlingRate", { rate: 4 });
+      const other = yield* broker.invoke<PreviewAutomationStatus>({
+        scope: asSession("agent-b"),
+        operation: "open",
+        input: { reuseExistingTab: false, show: false },
+      });
+      const otherLogs = yield* broker.invoke({
+        scope: asSession("agent-b"),
+        tabId: PreviewTabId.make(other.tabId!),
+        operation: "devtools",
+        input: { action: "console" },
+      });
+      expect(otherLogs).toMatchObject({ entries: [] });
+      // Closing a throttled tab resets its existing session before disposal.
+      const originalSend = cdp.send.getMockImplementation()!;
+      let resetComplete!: () => void;
+      const reset = new Promise<void>((resolve) => {
+        resetComplete = resolve;
+      });
+      cdp.send.mockImplementation(async (method, input) => {
+        const result = await originalSend(method, input);
+        if (method === "Network.emulateNetworkConditions") resetComplete();
+        return result;
+      });
+      yield* broker.invoke({ scope, tabId, operation: "close", input: {} });
+      yield* Effect.promise(() => reset);
+      expect(cdp.send).toHaveBeenCalledWith("Emulation.setCPUThrottlingRate", { rate: 1 });
     }),
   ).pipe(Effect.provide(layer)),
 );

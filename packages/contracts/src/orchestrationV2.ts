@@ -922,6 +922,10 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   /** Version 2 scopes provider-derived item ids by provider instance. */
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  /** Native prompt count inherited before this ACP thread's first app turn. */
+  acpHistoryBaseline: Schema.optional(NonNegativeInt),
+  /** Original native session location, needed when forking into another workspace. */
+  acpHistoryCwd: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;

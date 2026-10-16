@@ -1,7 +1,7 @@
 import { describe, expect, it, afterEach, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { FetchHttpClient } from "effect/unstable/http";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import {
   checkReleaseNotification,
   newerStableRelease,

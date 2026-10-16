@@ -1,4 +1,13 @@
 import {
+  PreviewConsoleInput,
+  PreviewNetworkInput,
+  PreviewNetworkRequestInput,
+  PreviewStylesInput,
+  PreviewEmulateInput,
+  PreviewPerformanceStartInput,
+  PreviewDevtoolsTargetInput,
+  PreviewDevtoolsTransferError,
+  PreviewDevtoolsCommandError,
   OrchestratorMcpFailure,
   ToolActivityIcon,
   PreviewAutomationClickInput,
@@ -33,6 +42,7 @@ import { Tool, Toolkit } from "effect/ai";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "../../PreviewAutomationBroker.ts";
 import * as ServerConfig from "../../../config.ts";
+import * as Devtools from "../../../preview/Devtools.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 
 const dependencies = [
@@ -312,7 +322,88 @@ const PreviewRecordingStopTool = safeBrowserTool(
   }).annotate(Tool.Title, "Stop browser recording"),
 );
 
+const devtoolsOptions = {
+  success: Schema.Struct({ data: Schema.Unknown }),
+  failure: Schema.Union([
+    PreviewToolFailure,
+    PreviewDevtoolsTransferError,
+    PreviewDevtoolsCommandError,
+  ]),
+  dependencies: [
+    McpInvocationContext.McpInvocationContext,
+    ThreadManagementService.ThreadManagementService,
+    Devtools.PreviewDevtools,
+  ],
+};
+const devtoolsTools = [
+  readonlyBrowserTool(
+    Tool.make("preview_console", {
+      ...devtoolsOptions,
+      parameters: PreviewConsoleInput,
+      description:
+        "Read recent console messages, JavaScript errors and bounded stack traces without taking a screenshot. Filter by level or afterId; at most 200 entries are retained per tab. Collection starts when browser automation attaches.",
+    }),
+  ),
+  readonlyBrowserTool(
+    Tool.make("preview_network", {
+      ...devtoolsOptions,
+      parameters: PreviewNetworkInput,
+      description:
+        "List successful, pending and failed HTTP requests with stable request IDs, status, duration and encoded size. At most 100 recent requests are retained. Use preview_network_request for details.",
+    }),
+  ),
+  readonlyBrowserTool(
+    Tool.make("preview_network_request", {
+      ...devtoolsOptions,
+      parameters: PreviewNetworkRequestInput,
+      description:
+        "Inspect a request ID from preview_network: request/response headers and timings. Authentication and cookie headers are always redacted. Set includeBody=true for a text response body capped at 64 KiB; bodies may already be evicted and are never re-fetched.",
+    }),
+  ),
+  readonlyBrowserTool(
+    Tool.make("preview_styles", {
+      ...devtoolsOptions,
+      parameters: PreviewStylesInput,
+      description:
+        "Inspect computed styles, inline declarations, matching CSS rules and nearby inherited rules for a main-document CSS selector. Optionally filter computed properties. Output is bounded and reports truncation; it does not claim to classify every cascade winner.",
+    }),
+  ),
+  safeBrowserTool(
+    Tool.make("preview_emulate", {
+      ...devtoolsOptions,
+      parameters: PreviewEmulateInput,
+      description:
+        "Set CPU slowdown (1-20x) and network emulation (none, fast-4g, slow-4g, 3g, offline). Use reset=true after testing. Settings persist until reset or debugger detach/tab closure. These are explicit approximations, not device simulation.",
+    }),
+  ),
+  safeBrowserTool(
+    Tool.make("preview_performance_start", {
+      ...devtoolsOptions,
+      parameters: PreviewPerformanceStartInput,
+      description:
+        "Start a Chromium timeline/JavaScript performance trace for the tab. Stops collecting automatically after durationSeconds (default 20, max 60) or when its bounded buffer fills. Interact with the page, then call preview_performance_stop to save the trace.",
+    }),
+  ),
+  safeBrowserTool(
+    Tool.make("preview_performance_stop", {
+      ...devtoolsOptions,
+      parameters: PreviewDevtoolsTargetInput,
+      description:
+        "Stop the tab's performance trace and transfer its JSON artifact (max 16 MiB) to this agent's environment. Returns a local path, duration and data-loss flag. Open it in Chrome DevTools Performance/Perfetto; raw trace events are not dumped into the tool response.",
+    }),
+  ),
+  readonlyBrowserTool(
+    Tool.make("preview_memory", {
+      ...devtoolsOptions,
+      parameters: PreviewDevtoolsTargetInput,
+      description:
+        "Read JavaScript heap usage, DOM node/document/listener counts and Chromium performance metrics. Repeat after the same page interactions to look for retained growth. Does not trigger garbage collection or create a full heap snapshot.",
+    }),
+  ),
+] as const;
+
 export const PreviewToolkit = Toolkit.make(
+  ...devtoolsTools,
   PreviewDialogTool,
   PreviewStatusTool,
   PreviewOpenTool,
@@ -335,6 +426,7 @@ export const PreviewToolkit = Toolkit.make(
 );
 
 export const PreviewStandardToolkit = Toolkit.make(
+  ...devtoolsTools,
   PreviewDialogTool,
   PreviewStatusTool,
   PreviewOpenTool,

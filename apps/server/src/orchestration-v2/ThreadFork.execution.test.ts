@@ -19,13 +19,14 @@ import * as Effect from "effect/Effect";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { ClaudeProviderCapabilitiesV2 } from "./Adapters/ClaudeAdapterV2.ts";
+import { GrokProviderCapabilitiesV2 } from "@t3tools/provider-grok/testing";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
-const forkCases = (["codex", "claudeAgent"] as const).flatMap((driverName) => {
+const forkCases = (["codex", "claudeAgent", "grok"] as const).flatMap((driverName) => {
   const driver = ProviderDriverKind.make(driverName);
   const instanceId = ProviderInstanceId.make(driver);
   const modelSelection = { instanceId, model: "test-model" };
@@ -34,7 +35,11 @@ const forkCases = (["codex", "claudeAgent"] as const).flatMap((driverName) => {
     driver,
     getCapabilities: () =>
       Effect.succeed(
-        driver === "codex" ? CodexProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2,
+        driver === "codex"
+          ? CodexProviderCapabilitiesV2
+          : driver === "grok"
+            ? GrokProviderCapabilitiesV2
+            : ClaudeProviderCapabilitiesV2,
       ),
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: () => Effect.die("Execution is paused after dispatch for handoff inspection"),
@@ -45,18 +50,36 @@ const forkCases = (["codex", "claudeAgent"] as const).flatMap((driverName) => {
     { runEffectWorker: false },
   );
 
-  return (["failed", "interrupted", "cancelled"] as const).map((status) => ({
+  const statuses =
+    driver === "grok"
+      ? (["failed", "interrupted", "cancelled", "completed"] as const)
+      : (["failed", "interrupted", "cancelled"] as const);
+  const cases = statuses.map((status) => ({
     driver,
     status,
     instanceId,
     modelSelection,
     layer,
+    nativeStrength: "weak" as "weak" | "strong" | null,
   }));
+  if (driver === "grok") {
+    cases.push(
+      ...["strong", null].map((nativeStrength) => ({
+        driver,
+        status: "completed" as const,
+        instanceId,
+        modelSelection,
+        layer,
+        nativeStrength: nativeStrength as "strong" | null,
+      })),
+    );
+  }
+  return cases;
 });
 
 it.effect.each(forkCases)(
-  "bounds $driver context when continuing a fork of a $status run",
-  ({ driver, status, instanceId, modelSelection, layer }) =>
+  "bounds $driver context when continuing a fork of a $status run with $nativeStrength turn ref",
+  ({ driver, status, instanceId, modelSelection, layer, nativeStrength }) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
@@ -112,7 +135,7 @@ it.effect.each(forkCases)(
       });
       // A cancelled queue entry has no provider turn; an early interruption
       // can have a turn but no native assistant cursor.
-      if (status === "interrupted") {
+      if ((status === "interrupted" || status === "completed") && nativeStrength !== null) {
         yield* eventSink.write({
           events: [
             {
@@ -145,7 +168,7 @@ it.effect.each(forkCases)(
                 providerThreadId,
                 nodeId: rootNodeId,
                 runAttemptId: attemptId,
-                nativeTurnRef: { driver, nativeId: "turn:synthetic", strength: "weak" },
+                nativeTurnRef: { driver, nativeId: "turn:synthetic", strength: nativeStrength },
                 ordinal: 1,
                 status,
                 startedAt: now,
@@ -175,7 +198,10 @@ it.effect.each(forkCases)(
                 providerThreadId,
                 userMessageId: messageId,
                 rootNodeId: null,
-                activeAttemptId: ordinal === 1 && status === "interrupted" ? attemptId : null,
+                activeAttemptId:
+                  ordinal === 1 && (status === "interrupted" || status === "completed")
+                    ? attemptId
+                    : null,
                 status: ordinal === 1 ? status : "completed",
                 queuePosition: null,
                 requestedAt: now,
@@ -240,6 +266,16 @@ it.effect.each(forkCases)(
         creationSource: "web",
       });
       const target = yield* orchestrator.getThreadProjection(targetThreadId);
+      if (nativeStrength === "strong") {
+        // The paused worker has not created the native session yet; dispatch
+        // records the exact source turn for the forthcoming provider fork.
+        assert.deepEqual(target.providerThreads[0]?.forkedFrom, {
+          providerThreadId,
+          providerTurnId,
+        });
+        assert.lengthOf(target.contextHandoffs, 0);
+        return;
+      }
       assert.equal(target.contextTransfers[0]?.resolution?.strategy, "portable_context");
       assert.lengthOf(target.contextHandoffs, 1);
       const handoff = target.contextHandoffs[0]!;

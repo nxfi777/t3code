@@ -1,6 +1,6 @@
 {
   "name": "@t3tools/web",
-  "version": "0.0.45",
+  "version": "0.1.0-personal.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -60,9 +60,11 @@
     "jose": "catalog:",
     "jsonc-parser": "3.3.1",
     "jszip": "3.10.1",
+    "katex": "^0.16.47",
     "lucide": "^0.564.0",
     "lucide-react": "^0.564.0",
     "mermaid": "^11.17.2",
+    "mdast-util-math": "^3.0.0",
     "morphicons": "^1.7.1",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -90,6 +92,8 @@
     "babel-plugin-react-compiler": "1.0.0",
     "compression": "^1.8.2",
     "jsdom": "^30.0.1",
+    "mdast-util-from-markdown": "^2.0.3",
+    "micromark-util-types": "^2.0.2",
     "react-test-renderer": "19.2.6",
     "tailwindcss": "^4.0.0",
     "unified": "catalog:",

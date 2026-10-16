@@ -5768,7 +5768,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 capabilities,
                 sameProvider:
                   pendingForkTransfer.sourceProviderInstanceId === modelSelection.instanceId,
-                hasStrongNativeSource: sourceProviderThread?.nativeThreadRef?.strength === "strong",
+                hasStrongNativeSource:
+                  sourceProviderThread?.nativeThreadRef?.strength === "strong" &&
+                  // Grok exposes prompt-index boundaries only after verification.
+                  // Legacy and ambiguous completed turns use the bounded transcript.
+                  (sourceProviderThread.driver !== "grok" ||
+                    sourceProjection?.providerTurns.find(
+                      (turn) =>
+                        turn.id === sourceProviderTurnId &&
+                        turn.providerThreadId === sourceProviderThread.id,
+                    )?.nativeTurnRef?.strength === "strong"),
                 sourceRunStatus: sourceRun.status,
                 fromSpecificTurn: sourceRun !== null,
               }),

@@ -40,6 +40,7 @@ import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as OrchestratorHandlers from "./toolkits/orchestrator/handlers.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import * as PreviewHandlers from "./toolkits/preview/handlers.ts";
+import * as PreviewDevtools from "../preview/Devtools.ts";
 import {
   PreviewSnapshotTool,
   PreviewSnapshotToolkit,
@@ -807,7 +808,7 @@ const layerPreviewSnapshotRegistration = imageToolRegistration(
 export const layerPreviewToolkit = Layer.mergeAll(
   layerPreviewStandardToolkitRegistration,
   layerPreviewSnapshotRegistration,
-);
+).pipe(Layer.provide(PreviewDevtools.layer));
 
 export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorToolkit,

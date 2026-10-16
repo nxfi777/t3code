@@ -27,6 +27,7 @@ export class DesktopAppIdentity extends Context.Service<
       string,
       DesktopUserData.DesktopUserDataInitializationError
     >;
+    readonly configureBeforeReady: Effect.Effect<void>;
     readonly configure: Effect.Effect<void>;
   }
 >()("@t3tools/desktop/app/DesktopAppIdentity") {}
@@ -87,17 +88,25 @@ export const make = Effect.gen(function* () {
 
   const userDataPath = Option.match(environment.desktopUserDataPathOverride, {
     onSome: (value) => Effect.succeed(environment.path.resolve(value)),
-    onNone: () => DesktopUserData.resolveUserDataPath(environment).pipe(Effect.provide(userDataContext)),
+    onNone: () =>
+      DesktopUserData.resolveUserDataPath(environment).pipe(Effect.provide(userDataContext)),
   });
+
+  const runtimeName = `${environment.branding.baseName} ${environment.branding.stageLabel}`;
+  // Electron 44 captures app.name for macOS Keychain service/account before ready:
+  // https://github.com/electron/electron/blob/v44.4.5/shell/browser/electron_browser_main_parts.cc#L591-L633
+  // Keep an explicit legacy identity until then; configure() restores the valid
+  // native User-Agent name before any preview page is opened.
+  const configureBeforeReady = electronApp.setName(
+    Option.getOrElse(environment.desktopAppNameOverride, () => runtimeName),
+  );
 
   const configure = Effect.gen(function* () {
     const commitHash = yield* resolveAboutCommitHash;
     // Electron removes spaces from this name to build the native User-Agent
     // product token, but leaves parentheses intact. Keep the runtime name valid
     // without rewriting preview sessions (which breaks Turnstile, #7110).
-    yield* electronApp.setName(
-      `${environment.branding.baseName} ${environment.branding.stageLabel}`,
-    );
+    yield* electronApp.setName(runtimeName);
     yield* electronApp.setAboutPanelOptions({
       applicationName: environment.displayName,
       applicationVersion: environment.appVersion,
@@ -122,6 +131,7 @@ export const make = Effect.gen(function* () {
 
   return DesktopAppIdentity.of({
     resolveUserDataPath: userDataPath,
+    configureBeforeReady,
     configure,
   });
 });

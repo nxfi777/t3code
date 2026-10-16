@@ -1,4 +1,5 @@
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import { grokNativeHistory } from "./nativeHistory.ts";
 import {
   XAiPromptFailureText,
   isXAiTaskCompletedWakeNotification,
@@ -90,8 +91,8 @@ export const GrokProviderCapabilitiesV2 = {
   threads: {
     ...AcpProviderCapabilitiesV2.threads,
     canReadThreadSnapshot: true,
-    canForkThread: false,
-    canForkFromTurn: false,
+    canForkThread: true,
+    canForkFromTurn: true,
   },
   subagents: {
     ...AcpProviderCapabilitiesV2.subagents,
@@ -235,6 +236,7 @@ export function makeGrokAcpAdapterFlavor(
     driver: GROK_PROVIDER,
     runtimeHarness: "Grok",
     capabilities: GrokProviderCapabilitiesV2,
+    nativeHistory: grokNativeHistory,
     interruptPromptOnCancel: false,
     // User Stop (requestRuntimeRestart) still hard-kills the process group and
     // respawns so existing background tasks stop too. Older 0.2.x builds could

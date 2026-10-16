@@ -219,7 +219,8 @@ describe("GrokAdapterV2 capabilities", () => {
   });
 
   it("declares Grok Task envelopes as native subagents", () => {
-    assert.isFalse(GrokProviderCapabilitiesV2.threads.canForkThread);
+    assert.isTrue(GrokProviderCapabilitiesV2.threads.canForkThread);
+    assert.isTrue(GrokProviderCapabilitiesV2.threads.canForkFromTurn);
     assert.isTrue(GrokProviderCapabilitiesV2.subagents.supportsSubagents);
     assert.isTrue(GrokProviderCapabilitiesV2.subagents.exposesSubagentThreadIds);
     assert.isTrue(GrokProviderCapabilitiesV2.subagents.emitsSubagentLifecycle);

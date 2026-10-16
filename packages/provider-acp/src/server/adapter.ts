@@ -213,7 +213,51 @@ export interface AcpAdapterV2ExtensionContext {
   readonly lastProposedPlanMarkdown: Effect.Effect<string | undefined>;
 }
 
+export interface AcpNativeHistoryPrompt {
+  readonly prompt: Array<EffectAcpSchema.ContentBlock>;
+  readonly observe: (notification: EffectAcpSchema.SessionNotification) => void;
+  /** Only a verified, completed native boundary may replace the weak turn ref. */
+  readonly complete: Effect.Effect<string | undefined>;
+}
+
+/** Provider-owned history extensions. Errors must never fall back to session replacement. */
+export interface AcpNativeHistory {
+  readonly probe: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+  ) => Effect.Effect<boolean>;
+  readonly baseline: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+    sessionId: string,
+  ) => Effect.Effect<number | undefined>;
+  readonly preparePrompt: (input: {
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    sessionId: string;
+    turnId: string;
+    prompt: Array<EffectAcpSchema.ContentBlock>;
+  }) => Effect.Effect<AcpNativeHistoryPrompt | undefined>;
+  readonly fork: (input: {
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    sourceSessionId: string;
+    sourceCwd: string;
+    cwd: string;
+    request: ProviderAdapter.ProviderAdapterV2ForkThreadInput;
+  }) => Effect.Effect<
+    {
+      sessionId: string;
+      baseline: number;
+      verify: Effect.Effect<void, EffectAcpErrors.AcpError>;
+    },
+    EffectAcpErrors.AcpError
+  >;
+  readonly rewind: (input: {
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    sessionId: string;
+    request: ProviderAdapter.ProviderAdapterV2RollbackThreadInput;
+  }) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+}
+
 export interface AcpAdapterV2Flavor {
+  readonly nativeHistory?: AcpNativeHistory;
   /** Interprets provider-specific prompt errors before they cross into orchestration. */
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
@@ -748,6 +792,8 @@ function makeProviderThread(input: {
   readonly ownerNodeId?: OrchestrationV2ProviderThread["ownerNodeId"];
   readonly forkedFrom?: OrchestrationV2ProviderThread["forkedFrom"];
   readonly itemIdentityVersion?: 2;
+  readonly historyBaseline?: number;
+  readonly historyCwd?: string;
   readonly now: DateTime.Utc;
 }): OrchestrationV2ProviderThread {
   return {
@@ -774,9 +820,17 @@ function makeProviderThread(input: {
     forkedFrom: input.forkedFrom ?? null,
     contextUsage: null,
     nativeMetadata:
-      input.itemIdentityVersion === undefined
+      input.itemIdentityVersion === undefined && input.historyBaseline === undefined
         ? null
-        : { itemIdentityVersion: input.itemIdentityVersion },
+        : {
+            ...(input.itemIdentityVersion === undefined
+              ? {}
+              : { itemIdentityVersion: input.itemIdentityVersion }),
+            ...(input.historyBaseline === undefined
+              ? {}
+              : { acpHistoryBaseline: input.historyBaseline }),
+            ...(input.historyCwd === undefined ? {} : { acpHistoryCwd: input.historyCwd }),
+          },
     createdAt: input.now,
     updatedAt: input.now,
   };
@@ -1136,6 +1190,8 @@ interface ActiveAcpTurn {
   readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
   readonly nativeThreadId: string;
   readonly nativeTurnId: string;
+  readonly historyPrompt?: AcpNativeHistoryPrompt;
+  verifiedNativeTurnId?: string;
   readonly startedAt: DateTime.Utc;
   readonly completed: Deferred.Deferred<void, never>;
   // Root item ordinals allocated in this turn. Subagent child items keep
@@ -4113,6 +4169,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           notification: EffectAcpSchema.SessionNotification,
         ) {
           const context = yield* Ref.get(activeTurn);
+          if (context?.nativeThreadId === notification.sessionId) {
+            context.historyPrompt?.observe(notification);
+          }
           const update = notification.update;
           if (yield* projectAgentTerminalUpdate(notification, context)) return;
           if (
@@ -6243,7 +6302,31 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         yield* Ref.set(activeSessionId, started.sessionId);
         yield* Ref.set(activeSessionSetup, started);
         rememberTerminalEnvironment(started.sessionId, yield* readMcpContext(input.threadId));
-        const capabilities = negotiatedCapabilities(flavor.capabilities, started);
+        const historySupported =
+          started.initializeResult.agentCapabilities?.loadSession === true &&
+          (yield* flavor.nativeHistory?.probe(runtime) ?? Effect.succeed(false));
+        const negotiated = negotiatedCapabilities(flavor.capabilities, started);
+        const capabilities =
+          flavor.nativeHistory === undefined
+            ? negotiated
+            : {
+                ...negotiated,
+                threads: {
+                  ...negotiated.threads,
+                  canForkThread: historySupported,
+                  canForkFromTurn: historySupported,
+                },
+                identity: {
+                  ...negotiated.identity,
+                  nativeTurnIds: historySupported
+                    ? ("strong" as const)
+                    : negotiated.identity.nativeTurnIds,
+                },
+                checkpointing: {
+                  ...negotiated.checkpointing,
+                  providerCanRollbackConversation: historySupported,
+                },
+              };
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -6517,8 +6600,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           runAttemptId: context.input.attemptId,
           nativeTurnRef: {
             driver,
-            nativeId: context.nativeTurnId,
-            strength: "weak",
+            nativeId: context.verifiedNativeTurnId ?? context.nativeTurnId,
+            strength: context.verifiedNativeTurnId === undefined ? "weak" : "strong",
           },
           ordinal: context.input.providerTurnOrdinal,
           status,
@@ -6646,6 +6729,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 updatedAt: now,
               },
             });
+          }
+          if (
+            settledStatus === "completed" &&
+            context.historyPrompt !== undefined &&
+            (yield* Ref.get(runningBackgroundTaskIds)).size === 0 &&
+            ![...context.subagents.values()].some(acpSubagentHasPendingBackgroundWork)
+          ) {
+            const verified = yield* context.historyPrompt.complete;
+            if (!context.interrupted && verified !== undefined)
+              context.verifiedNativeTurnId = verified;
           }
           const turn = providerTurnPayload(context, settledStatus, now);
           yield* Ref.update(providerTurns, (current) => {
@@ -6983,6 +7076,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
             const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
+            const historyPrompt =
+              historySupported && promptParts !== null
+                ? yield* flavor.nativeHistory!.preparePrompt({
+                    runtime,
+                    sessionId: requestedSessionId,
+                    turnId: nativeTurnId,
+                    prompt: promptParts.prompt,
+                  })
+                : undefined;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
             const completed = yield* Deferred.make<void, never>();
             const promptWireSettled = yield* Deferred.make<void, never>();
@@ -6992,13 +7094,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             const rememberedNativeMetadata = (yield* Ref.get(nativeMetadataBySessionId)).get(
               requestedSessionId,
             );
-            const initialNativeMetadata =
+            let initialNativeMetadata =
               rememberedNativeMetadata === undefined
                 ? (turnInput.providerThread.nativeMetadata ?? null)
                 : {
                     ...turnInput.providerThread.nativeMetadata,
                     ...rememberedNativeMetadata,
                   };
+            if (historySupported) {
+              initialNativeMetadata = {
+                ...initialNativeMetadata,
+                acpHistoryCwd: turnInput.runtimePolicy.cwd ?? process.cwd(),
+              };
+            }
             if (initialNativeMetadata !== null) {
               yield* Ref.update(nativeMetadataBySessionId, (current) =>
                 new Map(current).set(requestedSessionId, initialNativeMetadata),
@@ -7009,6 +7117,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               providerTurnId,
               nativeThreadId: requestedSessionId,
               nativeTurnId,
+              ...(historyPrompt === undefined ? {} : { historyPrompt }),
               startedAt,
               completed,
               itemOrdinals: new Map(),
@@ -7165,7 +7274,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
-            yield* runtime.prompt({ prompt: promptParts!.prompt }).pipe(
+            yield* runtime.prompt({ prompt: historyPrompt?.prompt ?? promptParts!.prompt }).pipe(
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
@@ -7320,6 +7429,30 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }),
         );
 
+        const assertNativeHistoryIdle = Effect.gen(function* () {
+          const active = yield* Ref.get(activeTurn);
+          const carryover = yield* Ref.get(carryoverSubagents);
+          if (
+            active !== null ||
+            (yield* Ref.get(runningBackgroundTaskIds)).size > 0 ||
+            (yield* Ref.get(wakeBuffer)).length > 0 ||
+            (yield* Ref.get(continuationRequested)) ||
+            carryover?.subagents.some(acpSubagentHasPendingBackgroundWork)
+          ) {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail:
+                "Wait for this ACP turn and its background work before changing native history",
+            });
+          }
+          if (!historySupported) {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: "ACP driver did not confirm native history support",
+            });
+          }
+        });
+
         const sessionRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: options.instanceId,
           driver,
@@ -7367,6 +7500,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   detail: "ACP runtime did not produce a session id",
                 });
               }
+              const historyBaseline = historySupported
+                ? yield* flavor.nativeHistory!.baseline(runtime, sessionId)
+                : undefined;
               const providerThread = makeProviderThread({
                 driver,
                 providerInstanceId: options.instanceId,
@@ -7374,6 +7510,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 appThreadId: threadInput.threadId,
                 providerSessionId: input.providerSessionId,
                 nativeThreadId: sessionId,
+                ...(historyBaseline === undefined ? {} : { historyBaseline }),
+                ...(historyBaseline === undefined
+                  ? {}
+                  : { historyCwd: input.runtimePolicy.cwd ?? process.cwd() }),
                 ...(itemIdentityVersion === undefined ? {} : { itemIdentityVersion }),
                 now,
               });
@@ -7902,6 +8042,92 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       detail: `Cannot roll back ACP provider thread ${rollbackInput.providerThread.id} while turn ${currentTurn.providerTurnId} is active`,
                     });
                   }
+                  if (flavor.nativeHistory !== undefined) {
+                    yield* assertNativeHistoryIdle;
+                    yield* awaitRuntimeTeardown();
+                    yield* restartRuntimeAfterTeardownIfRequired(
+                      rollbackInput.providerThread.appThreadId,
+                    );
+                    const sessionId = yield* nativeThreadId(driver, rollbackInput.providerThread);
+                    if ((yield* Ref.get(activeSessionId)) !== sessionId) {
+                      const activated = yield* activateSession(
+                        sessionId,
+                        rollbackInput.providerThread.appThreadId,
+                      );
+                      if (activated.sessionId !== sessionId) {
+                        return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver,
+                          detail: "ACP driver loaded a different native rollback session",
+                        });
+                      }
+                      yield* Ref.set(activeSessionId, activated.sessionId);
+                      yield* Ref.set(activeSessionSetup, activated);
+                      yield* Ref.set(activeSelection, null);
+                      yield* Ref.set(activeInteractionMode, null);
+                    }
+                    yield* flavor.nativeHistory.rewind({
+                      runtime,
+                      sessionId,
+                      request: rollbackInput,
+                    });
+                    // Reload the provider's retained conversation, including its tool context.
+                    yield* Ref.set(snapshot, {
+                      order: [],
+                      messages: new Map(),
+                      loadingRole: null,
+                      loadingMessageId: null,
+                      loadingIndex: 0,
+                    });
+                    yield* Ref.update(promptInstructionStates, (current) => {
+                      const retained = new Map(current);
+                      retained.delete(sessionId);
+                      return retained;
+                    });
+                    useProviderThreadIdentity(rollbackInput.providerThread);
+                    const mcpContext = yield* readMcpContext(
+                      rollbackInput.providerThread.appThreadId,
+                    );
+                    prepareTerminalEnvironment(mcpContext, sessionId);
+                    yield* Ref.set(activeSessionId, null);
+                    const loaded = yield* runtime.loadSession(
+                      sessionId,
+                      acpMcpActivation(mcpContext),
+                    );
+                    if (loaded.sessionId !== sessionId) {
+                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                        driver,
+                        detail: "ACP driver reloaded a different native rollback session",
+                      });
+                    }
+                    yield* Ref.set(activeSessionId, loaded.sessionId);
+                    yield* Ref.set(activeSessionSetup, loaded);
+                    yield* Ref.set(activeSelection, null);
+                    yield* Ref.set(activeInteractionMode, null);
+                    const retained = rollbackInput.providerThreadTurns.filter(
+                      (turn) =>
+                        turn.providerThreadId === rollbackInput.providerThread.id &&
+                        rollbackInput.target.type === "provider_turn" &&
+                        turn.ordinal <= rollbackInput.target.providerTurn.ordinal,
+                    );
+                    yield* Ref.set(
+                      providerTurns,
+                      new Map(retained.map((turn) => [String(turn.id), turn])),
+                    );
+                    const state = yield* Ref.get(snapshot);
+                    return {
+                      providerThread: {
+                        ...rollbackInput.providerThread,
+                        status: "idle" as const,
+                        updatedAt: yield* DateTime.now,
+                      },
+                      providerTurns: retained,
+                      messages: state.order.flatMap((key) => {
+                        const message = state.messages.get(key);
+                        return message === undefined ? [] : [message];
+                      }),
+                      runtimeRequests: [],
+                    };
+                  }
                   // ACP defines no conversation truncation, so rollback stages
                   // a fresh native session before retiring the original.
                   // Returning its binding keeps the next turn runnable without
@@ -8000,7 +8226,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       detail: "ACP driver did not negotiate session/fork",
                     });
                   }
-                  if (forkInput.providerTurnId !== undefined) {
+                  if (
+                    forkInput.providerTurnId !== undefined &&
+                    flavor.nativeHistory === undefined
+                  ) {
                     return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                       driver,
                       detail: "ACP session/fork can only fork the current session head",
@@ -8012,10 +8241,43 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   );
                   const mcpContext = yield* readMcpContext(forkInput.targetThreadId);
                   prepareTerminalEnvironment(mcpContext);
-                  const forked = yield* runtime.forkSession(
-                    sourceSessionId,
-                    acpMcpActivation(mcpContext),
-                  );
+                  const nativeFork =
+                    flavor.nativeHistory === undefined
+                      ? undefined
+                      : yield* Effect.gen(function* () {
+                          yield* assertNativeHistoryIdle;
+                          return yield* flavor.nativeHistory!.fork({
+                            runtime,
+                            sourceSessionId,
+                            sourceCwd:
+                              forkInput.sourceProviderThread.nativeMetadata?.acpHistoryCwd ?? "",
+                            cwd:
+                              forkInput.runtimePolicy?.cwd ??
+                              input.runtimePolicy.cwd ??
+                              process.cwd(),
+                            request: forkInput,
+                          });
+                        });
+                  if (nativeFork !== undefined) {
+                    yield* Ref.set(snapshot, {
+                      order: [],
+                      messages: new Map(),
+                      loadingRole: null,
+                      loadingMessageId: null,
+                      loadingIndex: 0,
+                    });
+                    yield* Ref.set(providerTurns, new Map());
+                    // A failed load must force the next operation to activate its
+                    // requested session rather than trust the previous binding.
+                    yield* Ref.set(activeSessionId, null);
+                  }
+                  const forked =
+                    nativeFork === undefined
+                      ? yield* runtime.forkSession(sourceSessionId, acpMcpActivation(mcpContext))
+                      : yield* runtime.loadSession(
+                          nativeFork.sessionId,
+                          acpMcpActivation(mcpContext),
+                        );
                   rememberTerminalEnvironment(
                     forked.sessionId,
                     yield* readMcpContext(forkInput.targetThreadId),
@@ -8024,6 +8286,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   yield* Ref.set(activeSessionSetup, forked);
                   yield* Ref.set(activeSelection, null);
                   yield* Ref.set(activeInteractionMode, null);
+                  if (nativeFork !== undefined) {
+                    if (forked.sessionId !== nativeFork.sessionId) {
+                      return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                        driver,
+                        detail: "ACP driver loaded a different native fork session",
+                      });
+                    }
+                    yield* nativeFork.verify;
+                  }
                   itemIdentityVersion = 2;
                   const now = yield* DateTime.now;
                   const providerThread = makeProviderThread({
@@ -8033,6 +8304,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     appThreadId: forkInput.targetThreadId,
                     providerSessionId: input.providerSessionId,
                     nativeThreadId: forked.sessionId,
+                    ...(nativeFork === undefined ? {} : { historyBaseline: nativeFork.baseline }),
+                    ...(nativeFork === undefined
+                      ? {}
+                      : {
+                          historyCwd:
+                            forkInput.runtimePolicy?.cwd ??
+                            input.runtimePolicy.cwd ??
+                            process.cwd(),
+                        }),
                     itemIdentityVersion: 2,
                     ...(forkInput.ownerNodeId === undefined
                       ? {}

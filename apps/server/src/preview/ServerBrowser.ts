@@ -2,6 +2,7 @@
 // Screencasts ignore emulated device scale; real 2x keeps captures sharp.
 // --disable-gpu uses cheaper software compositing while preserving SwiftShader WebGL.
 import {
+  PreviewDevtoolsInput as PreviewDevtoolsInputSchema,
   BUILT_IN_BROWSER_PROFILES,
   DEFAULT_BROWSER_PROFILE_ID,
   FILL_PREVIEW_VIEWPORT,
@@ -78,6 +79,7 @@ import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import * as DesktopBrowserChannel from "./DesktopBrowserChannel.ts";
 import * as PreviewManager from "./Manager.ts";
 import * as ServerBrowserPage from "./ServerBrowserPage.ts";
+import * as DevtoolsEngine from "./DevtoolsEngine.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
 import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
@@ -289,6 +291,7 @@ interface ServerTab {
   readonly tabId: string;
   readonly page: Page;
   readonly cdp: CDPSession;
+  readonly devtoolsOwner: number;
   /** Sessions of the page's frames that run in their own process. */
   readonly frameSessions: Map<Frame, CDPSession>;
   readonly createdAt: number;
@@ -368,6 +371,15 @@ const READ_OPERATIONS: ReadonlySet<PreviewAutomationRequest["operation"]> = new 
   "snapshot",
   "waitFor",
 ]);
+
+/** Classify both control gates from the same decoded action. */
+export function isReadOnlyOperation(
+  request: Pick<PreviewAutomationRequest, "operation" | "input">,
+): boolean {
+  if (request.operation !== "devtools") return READ_OPERATIONS.has(request.operation);
+  const decoded = Schema.decodeUnknownOption(PreviewDevtoolsInputSchema)(request.input);
+  return Option.isSome(decoded) && DevtoolsEngine.isReadOnlyAction(decoded.value);
+}
 
 const AGENT_TAB_LIMIT = 8;
 const SERVER_TAB_LIMIT = 32;
@@ -484,6 +496,8 @@ const CLIPBOARD_SCRIPT = `(() => {
 
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
+  const devtools = yield* DevtoolsEngine.make(config.browserArtifactsDir);
+  let devtoolsOwnerSequence = 0;
   const host = { platform: yield* HostProcess.Platform, arch: yield* HostProcess.Architecture };
   const manager = yield* PreviewManager.PreviewManager;
   const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
@@ -702,9 +716,15 @@ const make = Effect.gen(function* () {
     for (const viewer of tab.viewers) viewer.push({ _tag: end });
     void tab.control.close().catch(constVoid);
     // The desktop owns its page; letting go only ends this connection.
-    if (tab.desktop) void tab.desktop.close().catch(constVoid);
-    else void tab.page.close().catch(constVoid);
-    if (tab.isolatedContext) void tab.page.context().close().catch(constVoid);
+    void Effect.runPromise(
+      devtools
+        .detach(tab.devtoolsOwner, devtoolsSend(tab))
+        .pipe(Effect.timeout("5 seconds"), Effect.ignore),
+    ).finally(async () => {
+      if (tab.desktop) await tab.desktop.close().catch(constVoid);
+      else await tab.page.close().catch(constVoid);
+      if (tab.isolatedContext) await tab.page.context().close().catch(constVoid);
+    });
     void tab.recording?.encoder.close().catch(constVoid);
     void NodeFSP.rm(downloadDir(tab), { recursive: true, force: true }).catch(constVoid);
     reportLiveTabs();
@@ -789,6 +809,7 @@ const make = Effect.gen(function* () {
       tabId: snapshot.tabId,
       page,
       cdp,
+      devtoolsOwner: ++devtoolsOwnerSequence,
       frameSessions: new Map(),
       createdAt: Date.now(),
       usedAt: Date.now(),
@@ -817,6 +838,30 @@ const make = Effect.gen(function* () {
       captureLock: Promise.resolve(),
       capturing: 0,
     };
+    await Effect.runPromise(devtools.attach(tab.devtoolsOwner));
+    for (const event of [
+      "Runtime.consoleAPICalled",
+      "Runtime.exceptionThrown",
+      "Log.entryAdded",
+      "Network.requestWillBeSent",
+      "Network.responseReceived",
+      "Network.loadingFinished",
+      "Network.loadingFailed",
+      "Tracing.tracingComplete",
+      "CSS.styleSheetAdded",
+      "CSS.styleSheetRemoved",
+    ]) {
+      cdp.on(event as Parameters<CDPSession["on"]>[0], (params: unknown) => {
+        runFork(devtools.capture(tab.devtoolsOwner, event, params as Record<string, unknown>));
+      });
+    }
+    await cdp.send("Runtime.enable");
+    await cdp.send("Log.enable");
+    await cdp.send("Network.enable", {
+      maxTotalBufferSize: 4 * 1024 * 1024,
+      maxResourceBufferSize: 64 * 1024,
+      maxPostDataSize: 0,
+    });
     if (!desktop) {
       await page.setViewportSize(fixedViewportSize(tab.setting) ?? UNATTACHED_FILL_VIEWPORT);
     }
@@ -1739,7 +1784,7 @@ const make = Effect.gen(function* () {
       );
     }
     // Any tab in the thread can be read; acting is checked by its control.
-    if (!READ_OPERATIONS.has(request.operation) && !tab.control.agentMayAct(request.agentSessionId))
+    if (!isReadOnlyOperation(request) && !tab.control.agentMayAct(request.agentSessionId))
       throw new BrowserControlInterrupted(
         "This tab belongs to another agent session. You can read it, but open your own tab to act.",
         "agentMismatch",
@@ -1926,7 +1971,7 @@ const make = Effect.gen(function* () {
     // queueing behind the human's input. Its own tabs keep the takeover
     // contract: a human taking control interrupts every agent call.
     if (
-      READ_OPERATIONS.has(request.operation) &&
+      isReadOnlyOperation(request) &&
       tab.control.agentId !== agentSessionId &&
       !tab.control.agentCanActNow(agentSessionId)
     ) {
@@ -1954,9 +1999,63 @@ const make = Effect.gen(function* () {
     });
   };
 
+  // Cleanup bypasses ownership checks but only uses the existing tab session.
+  const devtoolsSend = (tab: ServerTab) => (method: string, params?: Record<string, unknown>) =>
+    Effect.tryPromise({
+      try: () =>
+        (
+          tab.cdp as unknown as {
+            send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+          }
+        ).send(method, params),
+      catch: (cause) =>
+        new DevtoolsEngine.PreviewDevtoolsError({
+          detail: "The browser diagnostic command failed.",
+          cause,
+        }),
+    });
+
   const executeTabOperation = async (tab: ServerTab, request: PreviewAutomationRequest) => {
     const input = request.input;
     switch (request.operation) {
+      case "devtools": {
+        const input = Schema.decodeUnknownSync(PreviewDevtoolsInputSchema)(request.input);
+        const generation = tab.control.generation;
+        const cleanup = devtoolsSend(tab);
+        const send = (
+          method: string,
+          params?: Record<string, unknown>,
+        ): Effect.Effect<
+          unknown,
+          DevtoolsEngine.PreviewDevtoolsError | BrowserControlInterrupted
+        > =>
+          Effect.suspend<
+            unknown,
+            DevtoolsEngine.PreviewDevtoolsError | BrowserControlInterrupted,
+            never
+          >(() => {
+            if (
+              tab.closing ||
+              (!DevtoolsEngine.isReadOnlyAction(input) &&
+                (tab.control.generation !== generation ||
+                  !tab.control.agentCanActNow(request.agentSessionId!)))
+            ) {
+              return Effect.fail(new BrowserControlInterrupted());
+            }
+            return cleanup(method, params);
+          });
+        return Effect.runPromise(
+          devtools.run(tab.devtoolsOwner, input, send, cleanup).pipe(
+            Effect.catchTags({
+              PreviewDevtoolsError: (error) =>
+                Effect.succeed({
+                  _tag: "PreviewDevtoolsFailure" as const,
+                  detail: error.detail.slice(0, 1024),
+                }),
+            }),
+          ),
+        );
+      }
       case "navigate": {
         const navigateInput = input as PreviewAutomationNavigateInput;
         await recordAction(tab, "navigate", () =>
@@ -2546,6 +2645,15 @@ const make = Effect.gen(function* () {
   );
   yield* Effect.addFinalizer(() =>
     Effect.promise(async () => {
+      await Promise.all(
+        [...tabs.values()].map((tab) =>
+          Effect.runPromise(
+            devtools
+              .detach(tab.devtoolsOwner, devtoolsSend(tab))
+              .pipe(Effect.timeout("5 seconds"), Effect.ignore),
+          ),
+        ),
+      );
       await contexts.close();
     }),
   );

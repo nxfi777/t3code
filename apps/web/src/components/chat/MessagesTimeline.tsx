@@ -328,6 +328,7 @@ interface TimelineRowSharedState {
   runs: ReadonlyArray<HandoffTimelineRun>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
+  supportsConversationRollback: boolean;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
   /** Sends text an MCP App asked to post, after the user approved it. */
   onSendAppMessage: ((text: string) => Promise<void>) | undefined;
@@ -1363,6 +1364,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
       runs,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
+      supportsConversationRollback,
       onRunShellCommand,
       findActive,
       onImageExpand,
@@ -1401,6 +1403,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
       runs,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
+      supportsConversationRollback,
       onRunShellCommand,
       findActive,
       onImageExpand,
@@ -2649,7 +2652,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           </span>
         </div>
       ) : null}
-      <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100">
+      <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums">
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>
             <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
@@ -2660,9 +2663,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
-            {typeof revertTurnCount === "number" && (
-              <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
-            )}
+            <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
             {resolvedContext.text && (
               <MessageCopyButton
                 // Structured paste needs the canonical links to retain their positions.
@@ -2761,11 +2762,20 @@ function RevertUserMessageButton({
   turnCount,
   messageId,
 }: {
-  turnCount: number;
+  turnCount: number | undefined;
   messageId: MessageId;
 }) {
   const ctx = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
+  const unavailableReason = activity.isRevertingCheckpoint
+    ? "Wait for the current edit to finish."
+    : activity.isWorking
+      ? "Stop the agent or wait for it to finish, then edit."
+      : !ctx.supportsConversationRollback
+        ? "This provider cannot edit chat history."
+        : turnCount === undefined
+          ? "This older message has no restore point."
+          : undefined;
 
   return (
     <Tooltip>
@@ -2775,15 +2785,20 @@ function RevertUserMessageButton({
             type="button"
             size="xs"
             variant="ghost"
-            disabled={activity.isRevertingCheckpoint || activity.isWorking}
-            onClick={() => ctx.onRevertToTurnCount(turnCount, messageId)}
+            aria-disabled={Boolean(unavailableReason)}
+            title={unavailableReason}
+            onClick={() => {
+              if (!unavailableReason && turnCount !== undefined)
+                ctx.onRevertToTurnCount(turnCount, messageId);
+            }}
             aria-label="Edit from here"
           />
         }
       >
         <Undo2Icon className="size-3" />
+        Edit
       </TooltipTrigger>
-      <TooltipPopup side="top">Edit from here</TooltipPopup>
+      <TooltipPopup side="top">{unavailableReason ?? "Edit from here"}</TooltipPopup>
     </Tooltip>
   );
 }
@@ -2941,8 +2956,16 @@ function AssistantForkButton({
     capabilities: support.providerSession?.capabilities,
   });
 
-  if (!canFork || projectedItem.item.runId === null) return null;
   const runId = projectedItem.item.runId;
+  const unavailableReason = busy
+    ? "Wait for the current fork to finish."
+    : !canFork
+      ? runId === null
+        ? "This older response has no fork point."
+        : projectedItem.item.status !== "completed"
+          ? "Wait for this response to finish before forking."
+          : "This provider cannot fork this response or hand off its history."
+      : undefined;
 
   return (
     <Tooltip>
@@ -2952,8 +2975,10 @@ function AssistantForkButton({
             type="button"
             size="xs"
             variant="ghost"
-            disabled={busy}
+            aria-disabled={Boolean(unavailableReason)}
+            title={unavailableReason}
             onClick={() => {
+              if (unavailableReason || runId === null) return;
               setBusy(true);
               void ctx
                 .onForkFromRun({ sourceThreadId: projectedItem.sourceThreadId, runId })
@@ -2964,8 +2989,9 @@ function AssistantForkButton({
         }
       >
         <GitForkIcon className={cn("size-3", busy && "animate-pulse")} />
+        Fork
       </TooltipTrigger>
-      <TooltipPopup side="top">Fork from this response</TooltipPopup>
+      <TooltipPopup side="top">{unavailableReason ?? "Fork from this response"}</TooltipPopup>
     </Tooltip>
   );
 }
@@ -3010,7 +3036,7 @@ function AssistantMessageMeta({
     <div
       className={cn(
         "flex items-center gap-2 text-xs tabular-nums transition-opacity duration-200",
-        alwaysVisible
+        alwaysVisible || projectedItem?.item.type === "assistant_message"
           ? "opacity-100"
           : "opacity-0 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover/assistant:opacity-100",
         className,

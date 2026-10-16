@@ -318,7 +318,7 @@ const startup = Effect.gen(function* () {
     });
   }
 
-  yield* appIdentity.configure;
+  yield* appIdentity.configureBeforeReady;
   yield* lifecycle.register;
   yield* clerk.configure;
 

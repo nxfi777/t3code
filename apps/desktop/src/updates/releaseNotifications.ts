@@ -1,7 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
-import { FetchHttpClient, HttpClient } from "effect/unstable/http";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
 
 export const UPSTREAM_RELEASE_URL = "https://api.github.com/repos/pingdotgg/t3code/releases/latest";
 

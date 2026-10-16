@@ -24,13 +24,16 @@ vi.mock("./chat/MermaidDiagram", () => ({
   MermaidDiagram: () => <svg aria-label="Diagram" />,
 }));
 vi.mock("../hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
+const settingsOverrides = vi.hoisted(() => ({ mathRenderingEnabled: false }));
 vi.mock("../hooks/useSettings", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../hooks/useSettings")>();
   const settings = actual.getClientSettings();
   return {
     ...actual,
-    useClientSettings: (select?: (value: typeof settings) => unknown) =>
-      select ? select(settings) : settings,
+    useClientSettings: (select?: (value: typeof settings) => unknown) => {
+      const value = { ...settings, ...settingsOverrides };
+      return select ? select(value) : value;
+    },
   };
 });
 vi.mock("./ui/tooltip", async () => {
@@ -1376,4 +1379,103 @@ describe("ChatMarkdown in-page links", () => {
       }
     },
   );
+});
+
+describe("ChatMarkdown math", () => {
+  it("keeps fenced math literal and completes streamed formulas alongside Mermaid", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    settingsOverrides.mathRenderingEnabled = true;
+    let renderer: ReactTestRenderer | undefined;
+    const prefix = "```mermaid\ngraph TD; A-->B\n```\n\n```text\n$x$\n```\n\n";
+    const render = (suffix: string, isStreaming = true) => (
+      <ChatMarkdown cwd="/tmp/project" text={prefix + suffix} isStreaming={isStreaming} />
+    );
+    const formulas = () =>
+      renderer!.root
+        .findAll((node) => node.type === "span" && node.props["data-markdown-math"] === "")
+        .map((formula) => formula.props["data-markdown-copy"]);
+    try {
+      await act(async () => {
+        renderer = create(render("$y"));
+      });
+      expect(formulas()).toEqual([]);
+      await act(async () => renderer!.update(render("$y$\n\n$$\nz")));
+      expect(formulas()).toEqual(["$y$"]);
+      await act(async () => renderer!.update(render("$y$\n\n$$\nz\n$$", false)));
+      expect(formulas()).toEqual(["$y$", "$$\nz\n$$\n\n"]);
+      expect(
+        renderer!.root.findAllByType("svg").some((node) => node.props["aria-label"] === "Diagram"),
+      ).toBe(true);
+      expect(JSON.stringify(renderer!.toJSON())).toContain("$x$");
+    } finally {
+      settingsOverrides.mathRenderingEnabled = false;
+      await act(async () => renderer?.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+  it("typesets only when enabled, keeping prices and task offsets intact", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const text = "Area $\\pi r^2$ costs $5 and $10.\n\n\\[\nE = mc^2\n\\]\n\n- [ ] check \\(x\\)";
+    const renderers: ReactTestRenderer[] = [];
+    const render = async (parseRawHtml: boolean) => {
+      await act(async () => {
+        renderers.push(
+          create(<ChatMarkdown cwd="/tmp/project" text={text} parseRawHtml={parseRawHtml} />),
+        );
+      });
+      const renderer = renderers.at(-1)!;
+      return {
+        formulas: renderer.root
+          .findAll((node) => node.type === "span" && node.props["data-markdown-math"] === "")
+          .map((formula) => formula.props["data-markdown-copy"]),
+        markerOffset: Number(renderer.root.findByType("li").props["data-task-marker-offset"]),
+      };
+    };
+
+    try {
+      expect((await render(true)).formulas).toEqual([]);
+      // Raw HTML carrying the math classes stays code while the setting is off.
+      await act(async () => {
+        renderers.push(
+          create(
+            <ChatMarkdown
+              cwd="/tmp/project"
+              text={'<code class="language-math math-inline">x</code>'}
+            />,
+          ),
+        );
+      });
+      expect(
+        renderers.at(-1)!.root.findAll((node) => node.props["data-markdown-math"] === ""),
+      ).toEqual([]);
+      settingsOverrides.mathRenderingEnabled = true;
+      // Both the sanitized raw-HTML pipeline and the literal one keep the math classes.
+      for (const parseRawHtml of [true, false]) {
+        const { formulas, markerOffset } = await render(parseRawHtml);
+        expect(formulas).toEqual(["$\\pi r^2$", "$$\nE = mc^2\n$$\n\n", "$x$"]);
+        expect(setMarkdownTaskChecked(text, markerOffset, true)).toBe(
+          text.replace("- [ ]", "- [x]"),
+        );
+      }
+      // List indentation recovery parses blocks again; they still typeset.
+      const recovered = await act(async () =>
+        create(
+          <ChatMarkdown
+            cwd="/tmp/project"
+            text={"-       intro\n\n        $$\n        x^2\n        $$"}
+          />,
+        ),
+      );
+      renderers.push(recovered);
+      expect(
+        recovered.root
+          .findAll((node) => node.type === "span" && node.props["data-markdown-math"] === "")
+          .map((formula) => formula.props["data-markdown-copy"]),
+      ).toEqual(["$$\nx^2\n$$\n\n"]);
+    } finally {
+      settingsOverrides.mathRenderingEnabled = false;
+      await act(async () => renderers.forEach((renderer) => renderer.unmount()));
+      vi.unstubAllGlobals();
+    }
+  });
 });

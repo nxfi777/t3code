@@ -1757,6 +1757,55 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("Partial response from the old attempt");
   });
 
+  it("keeps Edit visible and explains unavailable history without invoking it", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    vi.unstubAllGlobals();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const onRevertToTurnCount = vi.fn();
+    try {
+      await act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            onRevertToTurnCount={onRevertToTurnCount}
+            timelineEntries={[buildUserTimelineEntry("Original prompt")]}
+          />,
+        ),
+      );
+      const edit = container.querySelector<HTMLButtonElement>('[aria-label="Edit from here"]')!;
+      expect(edit.textContent).toBe("Edit");
+      expect(edit.closest(".opacity-0")).toBeNull();
+      expect(edit.getAttribute("aria-disabled")).toBe("true");
+      expect(edit.title).toBe("This provider cannot edit chat history.");
+      await act(async () => edit.click());
+      expect(onRevertToTurnCount).not.toHaveBeenCalled();
+      await act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            supportsConversationRollback
+            onRevertToTurnCount={onRevertToTurnCount}
+            timelineEntries={[buildUserTimelineEntry("Original prompt")]}
+          />,
+        ),
+      );
+      const supported = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Edit from here"]',
+      )!;
+      expect(supported.getAttribute("aria-disabled")).toBe("true");
+      expect(supported.title).toBe("This older message has no restore point.");
+      await act(async () => supported.click());
+      expect(onRevertToTurnCount).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("exposes a per-response fork action for completed assistant items", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const projectedItem = {
@@ -1785,9 +1834,11 @@ describe("MessagesTimeline", () => {
         streaming: false,
       },
     } as never;
-    const markup = renderToStaticMarkup(
+    const onForkFromRun = vi.fn(async () => {});
+    const props = (
       <MessagesTimeline
         {...buildProps()}
+        onForkFromRun={onForkFromRun}
         timelineEntries={[
           {
             id: "assistant-message-1",
@@ -1805,10 +1856,57 @@ describe("MessagesTimeline", () => {
             },
           },
         ]}
-      />,
+      />
     );
 
-    expect(markup).toContain('aria-label="Fork from this response"');
+    vi.unstubAllGlobals();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(props));
+      const fork = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Fork from this response"]',
+      )!;
+      expect(fork.textContent).toBe("Fork");
+      expect(fork.getAttribute("aria-disabled")).toBe("false");
+      expect(fork.closest(".opacity-0")).toBeNull();
+      await act(async () => fork.click());
+      expect(onForkFromRun).toHaveBeenCalledExactlyOnceWith({
+        sourceThreadId: "thread-1",
+        runId: "run-1",
+      });
+      const entry = props.props.timelineEntries[0];
+      await act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...props.props}
+            timelineEntries={[
+              {
+                ...entry,
+                projectedItem: {
+                  ...entry.projectedItem,
+                  item: { ...entry.projectedItem.item, runId: null },
+                },
+              },
+            ]}
+          />,
+        ),
+      );
+      const unavailable = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Fork from this response"]',
+      )!;
+      expect(unavailable.textContent).toBe("Fork");
+      expect(unavailable.getAttribute("aria-disabled")).toBe("true");
+      expect(unavailable.title).toBe("This older response has no fork point.");
+      await act(async () => unavailable.click());
+      expect(onForkFromRun).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("renders inline terminal labels with the composer chip UI", async () => {

@@ -5,7 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
-import { FetchHttpClient } from "effect/unstable/http";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Option from "effect/Option";
 import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { makeHarness } from "./updatesTestHarness.ts";

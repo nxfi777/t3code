@@ -1,3 +1,5 @@
+require_relative 'sdk_conditions'
+
 Pod::Spec.new do |s|
   s.name           = 'T3NativeControls'
   s.version        = '1.0.0'
@@ -14,6 +16,6 @@ Pod::Spec.new do |s|
   s.dependency 'ExpoModulesCore'
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
-  }
+  }.merge(T3NativeControlsSdkConditions.xcconfig(T3NativeControlsSdkConditions.detect_versions))
   s.source_files = '**/*.{h,m,mm,swift,hpp,cpp}'
 end

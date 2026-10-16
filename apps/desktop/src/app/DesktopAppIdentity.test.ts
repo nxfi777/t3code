@@ -147,6 +147,24 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect.each([undefined, "T3 Code (Alpha)"])(
+    "captures the explicit storage identity before ready, then restores the valid runtime name (%s)",
+    (override) => {
+      const calls: ElectronAppCalls = { setAboutPanelOptions: [], setDockIcon: [], setName: [] };
+      return withIdentity(
+        Effect.gen(function* () {
+          const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+          yield* identity.configureBeforeReady;
+          assert.deepEqual(calls.setName, [override ?? "T3 Code Beta"]);
+          yield* identity.configure;
+          assert.deepEqual(calls.setName, [override ?? "T3 Code Beta", "T3 Code Beta"]);
+          assert.match(calls.setName[1]!.replaceAll(" ", ""), /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/);
+        }),
+        { calls, environment: { env: { T3CODE_DESKTOP_APP_NAME: override } } },
+      );
+    },
+  );
+
   it.effect("isolates an explicit profile even when the original legacy profile exists", () =>
     withIdentity(
       Effect.gen(function* () {

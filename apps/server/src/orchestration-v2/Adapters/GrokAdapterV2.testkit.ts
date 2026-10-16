@@ -5,6 +5,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as AcpErrors from "effect-acp/errors";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
@@ -75,7 +76,36 @@ function layerGrokProviderAdapterRegistryReplay(
             ...(replayGate === undefined ? {} : { replayGate }),
             cancelMeta: GROK_ACP_CANCEL_META,
             initializeMeta: GROK_ACP_INITIALIZE_META,
-          })(runtimeInput).pipe(Effect.flatMap(makeXAiPromptCompletionRuntime)),
+          })(runtimeInput).pipe(
+            Effect.flatMap(makeXAiPromptCompletionRuntime),
+            Effect.map((runtime) => ({
+              ...runtime,
+              request: (method, payload) => {
+                // Older recordings predate native history negotiation. Model an
+                // unavailable extension without consuming an unrelated frame.
+                const recorded = transcript.entries.some(
+                  (entry) =>
+                    entry.type === "expect_outbound" &&
+                    typeof entry.frame === "object" &&
+                    entry.frame !== null &&
+                    "method" in entry.frame &&
+                    entry.frame.method === method,
+                );
+                return method === "_x.ai/rewind/points" &&
+                  !recorded &&
+                  typeof payload === "object" &&
+                  payload !== null &&
+                  Object.keys(payload).length === 0
+                  ? Effect.fail(
+                      new AcpErrors.AcpRequestError({
+                        code: -32601,
+                        errorMessage: "Native history absent from recording",
+                      }),
+                    )
+                  : runtime.request(method, payload);
+              },
+            })),
+          ),
         continuationRequests,
         assertComplete: makeAcpReplayCompletenessAssertion(fileSystem, statusPath, transcript),
         ...(replayGate === undefined

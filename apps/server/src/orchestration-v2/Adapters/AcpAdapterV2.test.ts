@@ -113,6 +113,261 @@ const layerTest = Layer.mergeAll(
 const ACP_TEST_DRIVER = ProviderDriverKind.make("acp-test");
 const decodeUnknownJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
+const makeNativeGrokHistoryHarness = Effect.fnUntraced(function* (
+  options: {
+    readonly supported?: boolean;
+    readonly rejectRewind?: boolean;
+  } = {},
+) {
+  const calls: Array<{ method: string; payload: unknown }> = [];
+  const counts = new Map<string, number>([["mock-session-1", 3]]);
+  let activeSessionId = "mock-session-1";
+  let substituteLoadSession = false;
+  let spawned = 0;
+  const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const path = yield* Path.Path;
+  const instanceId = ProviderInstanceId.make("grok-native-history-test");
+  const threadId = ThreadId.make("grok-native-history-thread");
+  const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    cwd: process.cwd(),
+  });
+  const modelSelection = { instanceId, model: "grok-build" };
+  const makeRuntime = makeMockRuntime({
+    childProcessSpawner,
+    mockAgentPath: yield* path.fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    ),
+    wrapRuntime: (native) => ({
+      ...native,
+      prompt: (input) =>
+        Effect.sync(() => {
+          counts.set(activeSessionId, (counts.get(activeSessionId) ?? 0) + 1);
+        }).pipe(Effect.andThen(native.prompt(input))),
+      loadSession: (sessionId, activation) =>
+        native.loadSession(sessionId, activation).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              activeSessionId = sessionId;
+            }),
+          ),
+          Effect.map((loaded) =>
+            substituteLoadSession ? { ...loaded, sessionId: "substituted-session" } : loaded,
+          ),
+        ),
+      request: (method, payload) =>
+        Effect.suspend((): Effect.Effect<unknown, EffectAcpErrors.AcpError> => {
+          calls.push({ method, payload });
+          const params = payload as Record<string, unknown>;
+          if (Object.keys(params).length === 0)
+            return Effect.fail(
+              new EffectAcpErrors.AcpRequestError({
+                code: options.supported === false ? -32601 : -32602,
+                errorMessage: "history probe",
+              }),
+            );
+          if (method === "_x.ai/rewind/points")
+            return Effect.succeed({
+              rewind_points: Array.from(
+                { length: counts.get(String(params.session_id)) ?? 0 },
+                (_, prompt_index) => ({ prompt_index }),
+              ),
+            });
+          if (method === "_x.ai/session/fork") {
+            counts.set("native-child", Number(params.targetPromptIndex) + 1);
+            return Effect.succeed({
+              parentSessionId: params.sourceSessionId,
+              newSessionId: "native-child",
+            });
+          }
+          if (method === "_x.ai/rewind/execute") {
+            if (options.rejectRewind)
+              return Effect.fail(EffectAcpErrors.AcpRequestError.internalError("Rejected rewind"));
+            counts.set(String(params.session_id), Number(params.target_prompt_index));
+            return Effect.succeed({
+              success: true,
+              target_prompt_index: params.target_prompt_index,
+              mode: "conversation_only",
+            });
+          }
+          return native.request(method, payload);
+        }),
+    }),
+  });
+  const adapter = yield* makeGrokAdapterV2({
+    instanceId,
+    settings: DEFAULT_GROK_SETTINGS,
+    environment: {},
+    hostPlatform: yield* HostProcess.Platform,
+    selfInvocation: yield* resolveSelfInvocation(),
+    makeRuntime: (input) =>
+      Effect.sync(() => {
+        spawned += 1;
+      }).pipe(Effect.andThen(makeRuntime(input))),
+  });
+  const runtime = yield* adapter.openSession({
+    threadId,
+    providerSessionId: ProviderSessionId.make("grok-history-session"),
+    modelSelection,
+    runtimePolicy,
+  });
+  const providerThread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+  const runTurn = (ordinal: number) =>
+    Effect.gen(function* () {
+      yield* runtime.startTurn(
+        makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          modelSelection,
+          ordinal,
+          now: yield* DateTime.now,
+        }),
+      );
+      yield* runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+      return yield* runtime.readThreadSnapshot({ providerThread });
+    });
+  return {
+    runtime,
+    providerThread,
+    runTurn,
+    counts,
+    calls,
+    spawned: () => spawned,
+    substituteLoad: () => {
+      substituteLoadSession = true;
+    },
+  };
+});
+
+describe("Grok native history through the ACP adapter", () => {
+  it.effect.each(["activation", "reload"] as const)(
+    "rejects a substituted native session during rollback %s",
+    (phase) =>
+      Effect.gen(function* () {
+        const harness = yield* makeNativeGrokHistoryHarness();
+        const before = yield* harness.runTurn(1);
+        if (phase === "activation") {
+          yield* harness.runtime.forkThread({
+            sourceProviderThread: harness.providerThread,
+            sourceProviderTurns: before.providerTurns,
+            providerTurnId: before.providerTurns[0]!.id,
+            targetThreadId: ThreadId.make("native-substitution-child"),
+          });
+        }
+        harness.substituteLoad();
+        const result = yield* harness.runtime
+          .rollbackThread({
+            providerThread: harness.providerThread,
+            providerThreadTurns: before.providerTurns,
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("native-history-start"),
+              appRunOrdinal: 0,
+            },
+          })
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.equal(harness.spawned(), 1);
+        // A reload failure follows the confirmed rewind; it cannot restore that mutation.
+        assert.equal(harness.counts.get("mock-session-1"), phase === "activation" ? 4 : 3);
+        assert.equal(
+          harness.calls.filter(
+            (call) =>
+              call.method === "_x.ai/rewind/execute" &&
+              Object.keys(call.payload as object).length > 0,
+          ).length,
+          phase === "activation" ? 0 : 1,
+        );
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect("forks a selected turn independently, rewinds the original, and prompts again", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeNativeGrokHistoryHarness();
+      assert.isTrue(harness.runtime.providerSession.capabilities.threads.canForkFromTurn);
+      assert.equal(harness.providerThread.nativeMetadata?.acpHistoryBaseline, 3);
+      const first = (yield* harness.runTurn(1)).providerTurns[0]!;
+      const second = yield* harness.runTurn(2);
+      assert.equal(first.nativeTurnRef?.strength, "strong");
+      const child = yield* harness.runtime.forkThread({
+        sourceProviderThread: harness.providerThread,
+        sourceProviderTurns: second.providerTurns,
+        providerTurnId: first.id,
+        targetThreadId: ThreadId.make("native-child-app"),
+      });
+      assert.equal(child.nativeThreadRef?.nativeId, "native-child");
+      assert.equal(child.nativeMetadata?.acpHistoryBaseline, 4);
+      assert.equal(harness.counts.get("mock-session-1"), 5);
+      assert.equal(harness.counts.get("native-child"), 4);
+      const rolledBack = yield* harness.runtime.rollbackThread({
+        providerThread: harness.providerThread,
+        providerThreadTurns: second.providerTurns,
+        target: {
+          type: "provider_turn",
+          checkpointId: CheckpointId.make("native-history-checkpoint"),
+          appRunOrdinal: 1,
+          providerTurn: first,
+        },
+      });
+      assert.equal(rolledBack.providerThread.nativeThreadRef?.nativeId, "mock-session-1");
+      assert.deepEqual(
+        rolledBack.providerTurns.map((turn) => turn.id),
+        [first.id],
+      );
+      assert.equal(harness.counts.get("mock-session-1"), 4);
+      assert.equal(harness.counts.get("native-child"), 4);
+      yield* harness.runTurn(3);
+      assert.equal(harness.counts.get("mock-session-1"), 5);
+      assert.equal(harness.spawned(), 1);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect.each([{ supported: false }, { rejectRewind: true }])(
+    "never replaces the session when native rewind fails: %j",
+    (options) =>
+      Effect.gen(function* () {
+        const harness = yield* makeNativeGrokHistoryHarness(options);
+        const before = yield* harness.runTurn(1);
+        const result = yield* harness.runtime
+          .rollbackThread({
+            providerThread: harness.providerThread,
+            providerThreadTurns: before.providerTurns,
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("native-history-start"),
+              appRunOrdinal: 0,
+            },
+          })
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.equal(harness.spawned(), 1);
+        assert.equal(harness.counts.get("mock-session-1"), 4);
+        assert.equal(
+          (yield* harness.runtime.readThreadSnapshot({ providerThread: harness.providerThread }))
+            .providerThread.nativeThreadRef?.nativeId,
+          "mock-session-1",
+        );
+        if (options.supported === false) {
+          assert.isFalse(harness.runtime.providerSession.capabilities.threads.canForkThread);
+          assert.equal(before.providerTurns[0]?.nativeTurnRef?.strength, "weak");
+          assert.isFalse(
+            harness.calls.some(
+              (call) =>
+                call.method === "_x.ai/rewind/execute" &&
+                Object.keys(call.payload as object).length > 0,
+            ),
+          );
+        }
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+});
+
 describe("acpProjectedCommandExitCode", () => {
   const successOutput = { type: "Bash", exit_code: 0 };
   const failedOutput = { type: "Bash", exit_code: 1 };
