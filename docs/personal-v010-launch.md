@@ -32,7 +32,7 @@ Unit tests verify phase selection. A native Electron 44.4.5 probe also passed: o
 
 The two databases diverge after that copy. For the real cutover, let working agents finish, stop the old app, and take a fresh consistent copy of the entire Personal home, attachments and Electron profile. Do not replace the live home with this test snapshot. Keep the old home and launcher for rollback, and do not run both versions against one home. Copy server/provider settings and keybindings as well as the database; browser appearance preferences live in the Electron profile.
 
-The iOS client must use the v2 protocol (official app 2.0 or later). The Personal backend keeps the upstream protocol; desktop-only additions such as the math renderer do not add native iOS controls. App Store binary compatibility needs confirmation on that installed version.
+The iOS client must use the v2 protocol (official app 2.0 or later). The Personal backend keeps the upstream protocol. The native client exposes response forks, but the desktop math renderer and Edit controls do not add native iOS controls. App Store binary compatibility needs confirmation on that installed version.
 
 Math rendering is controlled by **Settings → Appearance → Render math**. It is off in a fresh profile. Copying the old Electron profile at cutover preserves that device's preference.
 
@@ -60,7 +60,9 @@ A message-by-message comparison confirmed that all imported user/assistant text 
 | Delegation policy | 12 Python tests passed. |
 | Claude live flow | Blocked by provider HTTP 429 usage limit on the first test prompt. No live pass claimed. |
 | Final desktop UI and real browser DevTools | Remaining: the collaborative browser host disconnected after earlier browser checks. |
-| iOS native client | In progress; initial build exposed an upstream iOS 27.0 SDK guard issue. |
+| iOS native client | Built and installed on the iOS 27 simulator after fixing an upstream SDK guard. Pairing, chat loading, a response fork and a new Codex reply passed. Forking after an edit exposed an inherited-history display bug; the fix passed 48 regression tests and native retests of both existing and new forks. HTTP and WebSocket snapshots agree. This tests the development client, not the App Store binary. |
+
+The iOS retest initially reused a persisted snapshot from before the server fix. Removing and re-pairing the test environment did not clear that stale thread snapshot. Terminating the disposable app and clearing only that cached thread row produced the correct history. The migration uses a new v2 environment; do not treat a warm client cache as proof of the server's current projection.
 
 Grok's native rewind is not transactional with the subsequent session reload. If reload fails after a confirmed rewind, the operation reports failure but the native conversation may already be truncated. Session identity guards prevent accepting a different loaded session.
 

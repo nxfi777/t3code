@@ -1353,6 +1353,7 @@ export function isTurnItemAtOrBeforeRun(input: {
 function visibleTurnItemsThroughRun(input: {
   readonly sourceProjection: OrchestrationV2ThreadProjection;
   readonly sourceRunId: NonNullable<OrchestrationV2TurnItem["runId"]>;
+  readonly excludedRunIds: ReadonlyArray<RunId>;
 }): Array<Omit<OrchestrationV2ProjectedTurnItem, "position">> {
   const sourceRun = input.sourceProjection.runs.find((run) => run.id === input.sourceRunId);
   if (sourceRun === undefined) {
@@ -1360,6 +1361,7 @@ function visibleTurnItemsThroughRun(input: {
   }
 
   const runOrdinalById = new Map(input.sourceProjection.runs.map((run) => [run.id, run.ordinal]));
+  const excluded = new Set(input.excludedRunIds);
   const inheritedPrefix = input.sourceProjection.visibleTurnItems
     .filter(
       (row) => row.item.threadId !== input.sourceProjection.thread.id || row.item.type === "fork",
@@ -1372,6 +1374,7 @@ function visibleTurnItemsThroughRun(input: {
     }));
   const localPrefix = inheritedVisibleTurnItemsFromLocalItems(
     input.sourceProjection.turnItems.filter((item) => {
+      if (item.runId !== null && excluded.has(item.runId)) return false;
       if (
         isOrchestrationV2SupersededInterrupt({
           item,
@@ -1405,6 +1408,7 @@ function buildVisibleTurnItems(input: {
   const inherited = visibleTurnItemsThroughRun({
     sourceProjection: input.sourceProjection,
     sourceRunId: forkedFrom.runId,
+    excludedRunIds: forkedFrom.excludedRunIds ?? [],
   });
   const markerItem = makeForkMarkerTurnItem({
     targetProjection: input.projection,
@@ -1700,6 +1704,7 @@ function shellStatusFromStoredRunStatus(status: string | null): OrchestrationV2S
 function itemCountThroughRun(input: {
   readonly state: ShellThreadState;
   readonly runId: RunId;
+  readonly excludedRunIds: ReadonlyArray<RunId>;
 }): number {
   const runOrdinal = input.state.runOrdinalById.get(input.runId);
   if (runOrdinal === undefined) {
@@ -1707,7 +1712,9 @@ function itemCountThroughRun(input: {
   }
 
   let count = input.state.thread.historyOrigin === "v1_import" ? input.state.runlessItemCount : 0;
+  const excluded = new Set(input.excludedRunIds);
   for (const [runId, itemCount] of input.state.itemCountByRunId) {
+    if (excluded.has(runId)) continue;
     const itemRunOrdinal = input.state.runOrdinalById.get(runId);
     if (itemRunOrdinal !== undefined && itemRunOrdinal <= runOrdinal) {
       count += itemCount;
@@ -1772,7 +1779,11 @@ function visibleItemCountForShell(input: {
 
   return (
     inheritedPrefixCount +
-    itemCountThroughRun({ state: sourceState, runId: forkedFrom.runId }) +
+    itemCountThroughRun({
+      state: sourceState,
+      runId: forkedFrom.runId,
+      excludedRunIds: forkedFrom.excludedRunIds ?? [],
+    }) +
     1 +
     state.itemCount
   );
@@ -1861,6 +1872,88 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+
+    // Old forks did not record their discarded source runs. Recover that immutable
+    // boundary by event sequence, never wall-clock time or today's run status.
+    // Batch all requested forks: each relevant event stream is read once, and no
+    // timeline row performs an event lookup. New forks need no event-history read.
+    const resolveForkHistory = Effect.fnUntraced(function* (
+      threads: ReadonlyArray<OrchestrationV2AppThread>,
+    ) {
+      const legacy = threads.filter(
+        (thread) =>
+          thread.forkedFrom?.type === "run" && thread.forkedFrom.excludedRunIds === undefined,
+      );
+      if (legacy.length === 0) return threads;
+      const streamIds = [
+        ...new Set(
+          legacy.flatMap((thread) =>
+            thread.forkedFrom?.type === "run" ? [thread.id, thread.forkedFrom.threadId] : [],
+          ),
+        ),
+      ];
+      const events = yield* sql<{
+        readonly sequence: number;
+        readonly stream_id: string;
+        readonly event_type: string;
+        readonly run_id: string | null;
+      }>`
+        SELECT sequence, stream_id, event_type,
+          CASE WHEN event_type IN ('run.created', 'run.updated') THEN json_extract(payload_json, '$.id') END AS run_id
+        FROM orchestration_events INDEXED BY idx_orch_events_stream_sequence
+        WHERE aggregate_kind = 'thread'
+          AND stream_id IN (SELECT value FROM json_each(${encodeIdList(streamIds)}))
+          AND application_event_version = 2
+          AND (event_type = 'thread.created' OR
+            (event_type IN ('run.created', 'run.updated') AND json_extract(payload_json, '$.status') = 'rolled_back'))
+        ORDER BY sequence
+      `;
+      const created = new Map<string, number>();
+      const discarded = new Map<string, Map<RunId, number>>();
+      for (const event of events) {
+        if (event.event_type === "thread.created") created.set(event.stream_id, event.sequence);
+        else if (event.run_id !== null) {
+          const runs = discarded.get(event.stream_id) ?? new Map<RunId, number>();
+          const id = RunId.make(event.run_id);
+          if (!runs.has(id)) runs.set(id, event.sequence);
+          discarded.set(event.stream_id, runs);
+        }
+      }
+      return threads.map((thread) => {
+        const fork = thread.forkedFrom;
+        if (fork?.type !== "run" || fork.excludedRunIds !== undefined) return thread;
+        const boundary = created.get(thread.id);
+        // Projection-only fixtures and imported histories may have no event anchor.
+        // Preserve their historical prefix rather than guessing from current status.
+        const excludedRunIds =
+          boundary === undefined
+            ? []
+            : [...(discarded.get(fork.threadId) ?? [])]
+                .filter(([, sequence]) => sequence < boundary)
+                .map(([runId]) => runId);
+        return { ...thread, forkedFrom: { ...fork, excludedRunIds } };
+      });
+    });
+
+    // Resolve the entire ancestry once per paged/full read, including old forks.
+    // UNION deduplicates cycles without loading any ancestor timeline payloads.
+    const readForkHistory = Effect.fnUntraced(function* (threadId: ThreadId) {
+      const rows = yield* sql<PayloadRow>`
+        WITH RECURSIVE ancestors(thread_id, payload_json) AS (
+          SELECT thread_id, payload_json FROM orchestration_v2_projection_threads
+          WHERE thread_id = ${threadId}
+          UNION
+          SELECT parent.thread_id, parent.payload_json
+          FROM orchestration_v2_projection_threads AS parent
+          JOIN ancestors AS child ON parent.thread_id = json_extract(child.payload_json, '$.forkedFrom.threadId')
+          WHERE json_extract(child.payload_json, '$.forkedFrom.type') = 'run'
+        )
+        SELECT payload_json FROM ancestors
+      `;
+      const threads = yield* Effect.forEach(rows, (row) => decodeThreadPayload(row.payload_json));
+      const resolved = yield* resolveForkHistory(threads);
+      return new Map(resolved.map((thread) => [thread.id, thread]));
+    });
 
     // For run upserts: a snapshot without `path` keeps the value another event recorded there.
     const keepRecordedRunField = (payload: Statement.Fragment, path: string) => sql`
@@ -2770,6 +2863,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         readonly anchorItemId?: TurnItemId | undefined;
         readonly requiredRunId?: RunId | undefined;
         readonly suppressLocal?: boolean | undefined;
+        readonly excludedRunIds?: ReadonlyArray<RunId> | undefined;
       },
       fields?: ReadonlyArray<ProjectionRecordField>,
       filter?: ProjectionRecordFilter,
@@ -2808,6 +2902,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   LEFT JOIN orchestration_v2_projection_runs AS run
                     ON run.run_id = item.run_id
                   WHERE item.thread_id = ${threadId}
+                    AND (item.run_id IS NULL OR item.run_id NOT IN
+                      (SELECT value FROM json_each(${encodeIdList(window.excludedRunIds ?? [])})))
                     AND item.ordinal <= COALESCE(
                       (
                         SELECT ordinal
@@ -3433,10 +3529,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         readonly anchorItemId?: TurnItemId | undefined;
         readonly requiredRunId?: RunId | undefined;
         readonly suppressLocal?: boolean | undefined;
+        readonly excludedRunIds?: ReadonlyArray<RunId> | undefined;
         readonly historyAnchor?:
           | { readonly threadId: ThreadId; readonly itemId: TurnItemId }
           | undefined;
       },
+      forkHistory?: ReadonlyMap<ThreadId, OrchestrationV2AppThread>,
     ): Effect.Effect<OrchestrationV2ThreadProjection, ProjectionStoreV2Error> =>
       Effect.gen(function* () {
         const localWindow =
@@ -3446,13 +3544,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window;
         // Ancestors contribute timeline items, not their provider/control state.
         // Keep their runs and attempts for fork boundaries and visibility.
-        const projection = yield* readCanonicalProjection(
+        const canonical = yield* readCanonicalProjection(
           threadId,
           localWindow,
           window !== undefined && seenThreadIds.size > 0
             ? ["runs", "attempts", "turnItems"]
             : undefined,
         );
+        const history =
+          forkHistory ??
+          (canonical.thread.forkedFrom?.type === "run"
+            ? yield* readForkHistory(threadId)
+            : new Map());
+        const projection = { ...canonical, thread: history.get(threadId) ?? canonical.thread };
         const forkedFrom = projection.thread.forkedFrom;
         if (forkedFrom?.type !== "run" || seenThreadIds.has(forkedFrom.threadId)) {
           return withLocalVisibleTurnItems(projection);
@@ -3547,6 +3651,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   rowLimit: window.rowLimit,
                   userTurnLimit: window.userTurnLimit,
                   requiredRunId: forkedFrom.runId,
+                  excludedRunIds: forkedFrom.excludedRunIds ?? [],
                   suppressLocal: anchor === undefined || anchorIsInDescendant,
                   ...(anchor === undefined || anchorIsInDescendant
                     ? {}
@@ -3561,6 +3666,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           forkedFrom.threadId,
           new Set([...seenThreadIds, threadId]),
           sourceWindow,
+          history,
         );
         return {
           ...projection,
@@ -4971,6 +5077,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const readTimelineIndex = (
       threadId: ThreadId,
       seen: ReadonlySet<ThreadId>,
+      forkHistory?: ReadonlyMap<ThreadId, OrchestrationV2AppThread>,
     ): Effect.Effect<
       {
         readonly records: ProjectionRecords<"runs" | "attempts">;
@@ -5017,13 +5124,23 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           items,
         });
         const visible = local.filter((row) => isVisible(row.item));
-        const fork = records.thread.forkedFrom;
+        const history =
+          forkHistory ??
+          (records.thread.forkedFrom?.type === "run"
+            ? yield* readForkHistory(threadId)
+            : new Map());
+        const fork = (history.get(threadId) ?? records.thread).forkedFrom;
         if (fork?.type !== "run" || seen.has(fork.threadId)) return { records, local, visible };
-        const source = yield* readTimelineIndex(fork.threadId, new Set([...seen, threadId]));
+        const source = yield* readTimelineIndex(
+          fork.threadId,
+          new Set([...seen, threadId]),
+          history,
+        );
         const sourceRun = source.records.runs.find((run) => run.id === fork.runId);
         let inherited: Array<TimelineIndexRow> = [];
         if (sourceRun !== undefined) {
           const ordinals = new Map(source.records.runs.map((run) => [run.id, run.ordinal]));
+          const excluded = new Set(fork.excludedRunIds ?? []);
           const sourceItems = source.local.map((row) => row.item);
           inherited = [
             ...source.visible.filter(
@@ -5031,6 +5148,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ),
             ...source.local.filter(
               (row) =>
+                (row.item.runId === null || !excluded.has(row.item.runId)) &&
                 !isOrchestrationV2SupersededInterrupt({
                   item: row.item,
                   attempts: source.records.attempts,
@@ -5987,7 +6105,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         });
         const { providerThreadsByThreadId, pendingTurnItemsByThreadId } =
           yield* pendingBackgroundDataByThreadId({ providerThreadRows, pendingTurnItemRows });
-        const states = yield* Effect.forEach(threadRows, (row) =>
+        const rawStates = yield* Effect.forEach(threadRows, (row) =>
           shellThreadStateFromRow({
             row,
             runOrdinalsByThreadId,
@@ -5996,6 +6114,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             pendingTurnItemsByThreadId,
           }),
         );
+        const resolvedThreads = yield* resolveForkHistory(rawStates.map((state) => state.thread));
+        const states = rawStates.map((state, index) => ({
+          ...state,
+          thread: resolvedThreads[index]!,
+        }));
         const statesByThreadId = new Map(states.map((state) => [state.thread.id, state]));
 
         const shells = states
@@ -6077,7 +6200,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             const { providerThreadsByThreadId, pendingTurnItemsByThreadId } =
               yield* pendingBackgroundDataByThreadId({ providerThreadRows, pendingTurnItemRows });
 
-            const states = yield* Effect.forEach([...rowsByThreadId.values()], (row) =>
+            const rawStates = yield* Effect.forEach([...rowsByThreadId.values()], (row) =>
               shellThreadStateFromRow({
                 row,
                 runOrdinalsByThreadId,
@@ -6086,6 +6209,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 pendingTurnItemsByThreadId,
               }),
             );
+            const resolvedThreads = yield* resolveForkHistory(
+              rawStates.map((state) => state.thread),
+            );
+            const states = rawStates.map((state, index) => ({
+              ...state,
+              thread: resolvedThreads[index]!,
+            }));
             const statesByThreadId = new Map(states.map((state) => [state.thread.id, state]));
             const state = statesByThreadId.get(threadId);
             if (state === undefined) {

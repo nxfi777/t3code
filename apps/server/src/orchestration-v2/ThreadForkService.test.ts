@@ -106,11 +106,14 @@ function makeSourceProjection(sourceRun: OrchestrationV2Run): OrchestrationV2Thr
   };
 }
 
-const planFork = (sourceRun: OrchestrationV2Run) =>
+const planFork = (
+  sourceRun: OrchestrationV2Run,
+  runs: ReadonlyArray<OrchestrationV2Run> = [sourceRun],
+) =>
   Effect.gen(function* () {
     const service = yield* ThreadForkService.ThreadForkServiceV2;
     return yield* service.plan({
-      sourceProjection: makeSourceProjection(sourceRun),
+      sourceProjection: { ...makeSourceProjection(sourceRun), runs },
       sourceRun,
       sourceProviderThread: undefined,
       canonicalSourcePoint: {
@@ -164,6 +167,7 @@ it.effect("keeps a fork awake when its source thread is snoozed", () =>
       type: "run",
       threadId: sourceThreadId,
       runId: sourceRunId,
+      excludedRunIds: [],
     });
   }),
 );
@@ -175,6 +179,7 @@ it.effect("forks from a usage-limited failed run", () =>
       type: "run",
       threadId: sourceThreadId,
       runId: sourceRunId,
+      excludedRunIds: [],
     });
   }),
 );
@@ -189,5 +194,20 @@ it.effect("rejects in-progress and rolled-back fork sources", () =>
       assert.equal(error.targetThreadId, targetThreadId);
       assert.equal(error.cause, ThreadForkService.forkableSourceRunStatusError(sourceRun));
     }
+  }),
+);
+
+it.effect("captures only source runs already discarded within the fork boundary", () =>
+  Effect.gen(function* () {
+    const selected = { ...makeSourceRun("completed"), ordinal: 2 };
+    const discarded = { ...makeSourceRun("rolled_back"), id: RunId.make("discarded-before-fork") };
+    const later = { ...discarded, id: RunId.make("discarded-after-boundary"), ordinal: 3 };
+    const result = yield* planFork(selected, [discarded, selected, later]);
+    assert.deepEqual(result.targetThread.forkedFrom, {
+      type: "run",
+      threadId: sourceThreadId,
+      runId: selected.id,
+      excludedRunIds: [discarded.id],
+    });
   }),
 );

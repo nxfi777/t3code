@@ -55,7 +55,7 @@ export function forkableSourceRunStatusError(
 
 export interface ThreadForkServiceV2Shape {
   readonly plan: (input: {
-    readonly sourceProjection: Pick<OrchestrationV2ThreadProjection, "thread">;
+    readonly sourceProjection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs">;
     readonly sourceRun: OrchestrationV2Run;
     readonly sourceProviderThread: OrchestrationV2ProviderThread | undefined;
     readonly canonicalSourcePoint: OrchestrationV2ContextSourcePoint;
@@ -101,6 +101,11 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
             type: "run",
             threadId: input.sourceProjection.thread.id,
             runId: input.sourceRun.id,
+            excludedRunIds: input.sourceProjection.runs
+              .filter(
+                (run) => run.ordinal <= input.sourceRun.ordinal && run.status === "rolled_back",
+              )
+              .map((run) => run.id),
           },
           createdAt: input.createdAt,
           updatedAt: input.createdAt,
