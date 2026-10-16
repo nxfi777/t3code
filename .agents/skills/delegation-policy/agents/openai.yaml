@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegation Policy"
+  short_description: "Update worker models, effort, and advisor settings"
+  default_prompt: "Use $delegation-policy to inspect or update my Claude and Codex delegation settings."

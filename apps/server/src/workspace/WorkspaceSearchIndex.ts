@@ -26,6 +26,15 @@ import type {
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
 import { isProjectFaviconPath } from "@t3tools/shared/projectFavicon";
+import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
+import {
+  insertRankedSearchResult,
+  scoreQueryMatch,
+  type RankedSearchResult,
+} from "@t3tools/shared/searchRanking";
+
+import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as WorkspacePathCatalog from "./WorkspacePathCatalog.ts";
 
 // fff-node stays external to the CLI bundle because it dlopens a native
 // library. A static `import` of an external package is a hard error inside a
@@ -358,6 +367,7 @@ const waitForIndexReady = Effect.fn("WorkspaceSearchIndex.waitForIndexReady")(fu
 export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
   cwd: string,
   variant: WorkspaceSearchIndexVariant = "paths",
+  pathCatalog?: WorkspacePathCatalog.WorkspacePathCatalog,
 ) {
   const finder = yield* Effect.acquireRelease(createFinder(cwd, variant), (finder) =>
     Effect.try({
@@ -419,6 +429,7 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
   const refresh: WorkspaceSearchIndex["Service"]["refresh"] = Effect.fn(
     "WorkspaceSearchIndex.refresh",
   )(function* () {
+    if (pathCatalog) yield* pathCatalog.invalidate;
     const result = yield* Effect.try({
       try: () => finder.scanFiles(),
       catch: (cause) =>
@@ -446,6 +457,45 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
     );
   });
 
+  let previousCatalog: ProjectListEntriesResult | undefined;
+  let supplementaryEntries: readonly ProjectEntry[] = [];
+  let allowedPaths: ReadonlySet<string> | undefined;
+  const readSupplement = Effect.fn("WorkspaceSearchIndex.readSupplement")(function* () {
+    if (!pathCatalog) return { entries: [], truncated: false, allowedPaths: undefined };
+    const catalog = yield* pathCatalog.read.pipe(
+      Effect.mapError(
+        (cause) =>
+          new WorkspaceSearchIndexSearchFailed({
+            cwd,
+            queryLength: 0,
+            pageSize: WORKSPACE_INDEX_MAX_ENTRIES,
+            reason: "Filename catalog scan failed.",
+            cause,
+          }),
+      ),
+    );
+    if (catalog !== previousCatalog) {
+      // Compare against the whole bounded native index, not just this query's
+      // first page: existing code files retain fff's ranking and typo tolerance.
+      const result = yield* runSearch("", WORKSPACE_INDEX_PAGE_SIZE, "mixedSearch", () =>
+        finder.mixedSearch("", { pageSize: WORKSPACE_INDEX_PAGE_SIZE }),
+      );
+      const indexed = new Set(
+        mapMixedSearchResult(result, WORKSPACE_INDEX_MAX_ENTRIES).entries.map(
+          (entry) => entry.path,
+        ),
+      );
+      supplementaryEntries = catalog.entries.filter((entry) => !indexed.has(entry.path));
+      // Native rescans/watch events can admit paths that the initial scan
+      // excluded. A complete filename catalog also enforces current ignores.
+      allowedPaths = catalog.truncated
+        ? undefined
+        : new Set(catalog.entries.map((entry) => entry.path));
+      previousCatalog = catalog;
+    }
+    return { entries: supplementaryEntries, truncated: catalog.truncated, allowedPaths };
+  });
+
   const list: WorkspaceSearchIndex["Service"]["list"] = Effect.fn("WorkspaceSearchIndex.list")(
     function* () {
       const incompleteBeforeQuery = hasIncompleteInitialScan();
@@ -453,14 +503,26 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
         finder.mixedSearch("", { pageSize: WORKSPACE_INDEX_PAGE_SIZE }),
       );
       const mapped = mapMixedSearchResult(result, WORKSPACE_INDEX_MAX_ENTRIES);
-      const sortedEntries = withDirectoryAncestors(mapped.entries).toSorted((left, right) =>
+      const supplement = yield* readSupplement();
+      const merged = new Map(
+        [
+          ...mapped.entries.filter(
+            (entry) => !supplement.allowedPaths || supplement.allowedPaths.has(entry.path),
+          ),
+          ...supplement.entries,
+        ].map((entry) => [entry.path, entry]),
+      );
+      const sortedEntries = withDirectoryAncestors([...merged.values()]).toSorted((left, right) =>
         left.path.localeCompare(right.path),
       );
       const entries = sortedEntries.slice(0, WORKSPACE_INDEX_MAX_ENTRIES);
       return {
         entries,
         truncated:
-          incompleteBeforeQuery || mapped.truncated || entries.length < sortedEntries.length,
+          incompleteBeforeQuery ||
+          mapped.truncated ||
+          supplement.truncated ||
+          entries.length < sortedEntries.length,
       };
     },
   );
@@ -468,27 +530,99 @@ export const make = Effect.fn("WorkspaceSearchIndex.make")(function* (
   const search: WorkspaceSearchIndex["Service"]["search"] = Effect.fn(
     "WorkspaceSearchIndex.search",
   )(function* (query, limit, kind, imageOnly) {
-    const pageSize = imageOnly ? WORKSPACE_INDEX_PAGE_SIZE : Math.max(1, limit + 1);
     const incompleteBeforeQuery = hasIncompleteInitialScan();
-    if (kind === "file" || imageOnly) {
-      const result = yield* runSearch(query, pageSize, "fileSearch", () =>
-        finder.fileSearch(query, { pageSize }),
+    const supplement = yield* readSupplement();
+    let pageSize = imageOnly ? WORKSPACE_INDEX_PAGE_SIZE : Math.max(1, limit + 1);
+    let native: ProjectSearchEntriesResult;
+    do {
+      if (kind === "file" || imageOnly) {
+        const result = yield* runSearch(query, pageSize, "fileSearch", () =>
+          finder.fileSearch(query, { pageSize }),
+        );
+        native = mapFileSearchResult(result, pageSize, imageOnly);
+      } else if (kind === "directory") {
+        const result = yield* runSearch(query, pageSize, "directorySearch", () =>
+          finder.directorySearch(query, { pageSize }),
+        );
+        native = mapDirectorySearchResult(result, pageSize);
+      } else {
+        const result = yield* runSearch(query, pageSize, "mixedSearch", () =>
+          finder.mixedSearch(query, { pageSize }),
+        );
+        native = mapMixedSearchResult(result, pageSize);
+      }
+      native = {
+        ...native,
+        entries: native.entries.filter(
+          (entry) => !supplement.allowedPaths || supplement.allowedPaths.has(entry.path),
+        ),
+      };
+      if (
+        native.entries.length > limit ||
+        !native.truncated ||
+        pageSize >= WORKSPACE_INDEX_PAGE_SIZE
+      )
+        break;
+      // Only overfetch when current ignore rules removed native results.
+      // Ordinary keystrokes keep the small native page and original ordering.
+      pageSize = Math.min(WORKSPACE_INDEX_PAGE_SIZE, pageSize * 2);
+    } while (true);
+    const ranked: RankedSearchResult<ProjectEntry>[] = [];
+    const normalizedQuery = query.toLowerCase();
+    for (const entry of supplement.entries) {
+      if (
+        imageOnly
+          ? entry.kind !== "file" || !isWorkspaceImagePreviewPath(entry.path)
+          : kind && entry.kind !== kind
+      )
+        continue;
+      const path = entry.path.toLowerCase();
+      const filename = path.slice(path.lastIndexOf("/") + 1);
+      const direct = !normalizedQuery || path.includes(normalizedQuery);
+      const score = !normalizedQuery
+        ? 0
+        : scoreQueryMatch({
+            value: path,
+            query: normalizedQuery,
+            exactBase: 0,
+            prefixBase: 100,
+            includesBase: 200,
+            fuzzyBase: 10_000,
+          });
+      if (score === null) continue;
+      insertRankedSearchResult(
+        ranked,
+        {
+          item: entry,
+          score: direct ? (filename === normalizedQuery ? -1 : Math.min(score, 9_999)) : score,
+          tieBreaker: entry.path,
+        },
+        limit + 1,
       );
-      const mapped = mapFileSearchResult(result, limit, imageOnly);
-      return { ...mapped, truncated: incompleteBeforeQuery || mapped.truncated };
     }
-    if (kind === "directory") {
-      const result = yield* runSearch(query, pageSize, "directorySearch", () =>
-        finder.directorySearch(query, { pageSize }),
-      );
-      const mapped = mapDirectorySearchResult(result, limit);
-      return { ...mapped, truncated: incompleteBeforeQuery || mapped.truncated };
-    }
-    const result = yield* runSearch(query, pageSize, "mixedSearch", () =>
-      finder.mixedSearch(query, { pageSize }),
-    );
-    const mapped = mapMixedSearchResult(result, limit);
-    return { ...mapped, truncated: incompleteBeforeQuery || mapped.truncated };
+    // A visible filename match beats unrelated native fuzzy hits; fuzzy-only
+    // supplementary matches follow native results. Deduplicate watcher races.
+    // Keep the entire native prefix through an exact match so prioritizing
+    // that match over document substrings never reorders native code hits.
+    const lastExactNativeIndex = normalizedQuery
+      ? native.entries.findLastIndex(
+          (entry) =>
+            entry.path.toLowerCase() === normalizedQuery ||
+            entry.path.slice(entry.path.lastIndexOf("/") + 1).toLowerCase() === normalizedQuery,
+        )
+      : -1;
+    const ordered = [
+      ...native.entries.slice(0, lastExactNativeIndex + 1),
+      ...ranked.filter((entry) => entry.score < 10_000).map((entry) => entry.item),
+      ...native.entries,
+      ...ranked.filter((entry) => entry.score >= 10_000).map((entry) => entry.item),
+    ];
+    const entries = [...new Map(ordered.map((entry) => [entry.path, entry])).values()];
+    return {
+      entries: entries.slice(0, limit),
+      truncated:
+        incompleteBeforeQuery || native.truncated || supplement.truncated || entries.length > limit,
+    };
   });
 
   const searchContents: WorkspaceSearchIndex["Service"]["searchContents"] = Effect.fn(
@@ -577,7 +711,16 @@ function parseWorkspaceSearchIndexKey(key: string): {
  */
 export const layer = (key: string) => {
   const { cwd, variant } = parseWorkspaceSearchIndexKey(key);
-  return Layer.effect(WorkspaceSearchIndex, make(cwd, variant));
+  return Layer.effect(
+    WorkspaceSearchIndex,
+    Effect.gen(function* () {
+      const catalog =
+        variant === "paths"
+          ? yield* WorkspacePathCatalog.make(cwd, (yield* VcsProcess.VcsProcess).run)
+          : undefined;
+      return yield* make(cwd, variant, catalog);
+    }),
+  ).pipe(Layer.provide(VcsProcess.layer));
 };
 
 export class WorkspaceSearchIndexMap extends LayerMap.Service<WorkspaceSearchIndexMap>()(
