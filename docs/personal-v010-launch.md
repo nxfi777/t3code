@@ -58,8 +58,9 @@ A message-by-message comparison confirmed that all imported user/assistant text 
 | Math in browser | Inline and display equations rendered in user and assistant messages after enabling the preference. |
 | Native credential identity | Synthetic encrypted sentinel survived the pre-ready legacy name and post-ready runtime name transition. |
 | Delegation policy | 12 Python tests passed. |
-| Claude live flow | Blocked by provider HTTP 429 usage limit on the first test prompt. No live pass claimed. |
-| Final desktop UI and real browser DevTools | Remaining: the collaborative browser host disconnected after earlier browser checks. |
+| Claude live flow | Passed with Claude Haiku 5.5 after the reported quota reset: selected-turn native fork, source-context preservation, rewind/re-prompt, and invalid-checkpoint rejection. |
+| Final web UI | Browser connection recovered. Visible Edit/Fork, edit confirmation/cancel, inline/display math, and layouts at 375, 768 and 1440 px passed. No document overflow at those widths. Claude controls also rendered. |
+| Real browser DevTools | The upgraded ServerBrowser, broker and DevTools service passed against real pinned Chromium: console, network/body, computed/matched styles, memory, 4× CPU/Fast 4G, reset and trace export (340 events, no reported data loss). The original desktop host failed trace export; the v0.1.0 native desktop CDP relay still needs a direct check. |
 | iOS native client | Built and installed on the iOS 27 simulator after fixing an upstream SDK guard. Pairing, chat loading, a response fork and a new Codex reply passed. Forking after an edit exposed an inherited-history display bug; the fix passed 48 regression tests and native retests of both existing and new forks. HTTP and WebSocket snapshots agree. This tests the development client, not the App Store binary. |
 
 The iOS retest initially reused a persisted snapshot from before the server fix. Removing and re-pairing the test environment did not clear that stale thread snapshot. Terminating the disposable app and clearing only that cached thread row produced the correct history. The migration uses a new v2 environment; do not treat a warm client cache as proof of the server's current projection.
