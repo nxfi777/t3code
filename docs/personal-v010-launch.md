@@ -1,4 +1,14 @@
-# Personal v0.1.0 staging launch
+# Personal v0.1.0 launch
+
+## Installed Personal launcher
+
+`scripts/launch-personal.py --previous-root /path/to/previous/checkout` launches the prepared production build on port 3773. While the previous Personal app is open, it brings that window forward without interrupting agents. After a full quit, the next launch copies the latest stopped Personal home and Electron profile into this checkout's `.t3/personal`, verifies the database, and opens v0.1.0. No Terminal window needs to remain open.
+
+The old home stays intact. Existing v0.1.0 data is never overwritten or refreshed automatically. The copy preserves the environment ID and relay credentials so the mobile app can reconnect to the same environment. First launch can take longer while copying data and importing chats; copied credentials may prompt for Keychain access. Local readiness requires protocol 2 and the original environment ID; it does not verify the managed relay or the physical iPhone.
+
+For rollback, fully quit v0.1.0, then run the saved previous launcher. Never run the two copies of this environment together. New messages written in v0.1.0 do not appear in the old database; keep both homes, and reconcile any later rollback deliberately.
+
+## Isolated staging launcher
 
 The staging launcher uses `.t3/review/test-home` for server data, `.t3/review/electron-profile` for Electron data, and port 3774. It does not point at the running Personal build's data or change its launcher.
 
@@ -63,7 +73,7 @@ A message-by-message comparison confirmed that all imported user/assistant text 
 | Real browser DevTools | The upgraded ServerBrowser, broker and DevTools service passed against real pinned Chromium: console, network/body, computed/matched styles, memory, 4× CPU/Fast 4G, reset and trace export (340 events, no reported data loss). The original desktop host failed trace export; the v0.1.0 native desktop CDP relay still needs a direct check. |
 | iOS native client | Built and installed on the iOS 27 simulator after fixing an upstream SDK guard. Pairing, chat loading, a response fork and a new Codex reply passed. Forking after an edit exposed an inherited-history display bug; the fix passed 48 regression tests and native retests of both existing and new forks. HTTP and WebSocket snapshots agree. This tests the development client, not the App Store binary. |
 
-The iOS retest initially reused a persisted snapshot from before the server fix. Removing and re-pairing the test environment did not clear that stale thread snapshot. Terminating the disposable app and clearing only that cached thread row produced the correct history. The migration uses a new v2 environment; do not treat a warm client cache as proof of the server's current projection.
+The iOS retest initially reused a persisted snapshot from before the server fix. Removing and re-pairing the test environment did not clear that stale thread snapshot. Terminating the disposable app and clearing only that cached thread row produced the correct history. That test used a separate environment; the production cutover preserves the existing environment ID. Do not treat a warm client cache as proof of the server's current projection.
 
 Grok's native rewind is not transactional with the subsequent session reload. If reload fails after a confirmed rewind, the operation reports failure but the native conversation may already be truncated. Session identity guards prevent accepting a different loaded session.
 
