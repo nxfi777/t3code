@@ -2,6 +2,7 @@ import importlib.util
 from contextlib import closing
 import json
 import os
+import plistlib
 from pathlib import Path
 import socket
 import sqlite3
@@ -221,6 +222,7 @@ http.server.HTTPServer(('127.0.0.1', int(os.environ['T3CODE_PORT'])), Handler).s
 
         try:
             with patch.object(launcher, 'processes', return_value=[]), \
+                    patch.object(launcher, 'prepare_runtime_identity'), \
                     patch.object(launcher.subprocess, 'Popen', side_effect=tracked_spawn):
                 launcher.launch(self.base / 'old', root, port)
             self.assertEqual(len(children), 1)
@@ -233,6 +235,39 @@ http.server.HTTPServer(('127.0.0.1', int(os.environ['T3CODE_PORT'])), Handler).s
             for child in children:
                 child.terminate()
                 child.wait(timeout=5)
+
+    def test_personal_identity_is_distinct_and_keeps_url_scheme(self):
+        root = self.base / 'new'
+        bundle = launcher.electron(root, 'Beta').parents[2]
+        info_path = bundle / 'Contents/Info.plist'
+        info_path.parent.mkdir(parents=True)
+        original = {'CFBundleIdentifier': 'com.t3tools.t3code', 'CFBundleExecutable': 'Electron',
+                    'CFBundleURLTypes': [{'CFBundleURLName': 'com.t3tools.t3code', 'CFBundleURLSchemes': ['t3code']}]}
+        info_path.write_bytes(plistlib.dumps(original))
+        with patch.object(launcher, 'processes', return_value=[]), patch.object(launcher.subprocess, 'run') as run:
+            launcher.prepare_runtime_identity(root)
+            self.assertEqual(run.call_count, 2)
+            run.reset_mock()
+            launcher.prepare_runtime_identity(root)
+            self.assertEqual(run.call_count, 1)  # Verify, without repeatedly signing.
+        actual = plistlib.loads(info_path.read_bytes())
+        self.assertEqual(actual['CFBundleIdentifier'], launcher.PERSONAL_BUNDLE_ID)
+        self.assertEqual(actual['CFBundleExecutable'], 'Electron')
+        self.assertEqual(actual['CFBundleURLTypes'][0]['CFBundleURLSchemes'], ['t3code'])
+        self.assertEqual(plistlib.loads((root / '.t3/runtime-identity-backup/Contents/Info.plist').read_bytes()), original)
+
+    def test_runtime_identity_cannot_change_while_personal_runs(self):
+        root = self.base / 'new'
+        running = [(12345, f'{launcher.electron(root, "Beta")} {root}/apps/desktop/dist-electron/main.cjs')]
+        with patch.object(launcher, 'processes', return_value=running):
+            with self.assertRaisesRegex(RuntimeError, 'Quit Personal'):
+                launcher.prepare_runtime_identity(root)
+
+    def test_original_app_conflict_has_actionable_message(self):
+        running = [(12345, '/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)')]
+        with patch.object(launcher, 'processes', return_value=running):
+            with self.assertRaisesRegex(RuntimeError, 'original T3 Code.*Quit Alpha'):
+                launcher.require_stopped(self.base / 'old', self.base / 'new', 0)
 
 
 if __name__ == '__main__':

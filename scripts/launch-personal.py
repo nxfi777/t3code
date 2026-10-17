@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import shlex
 import socket
@@ -24,6 +25,45 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = '.personal-v010-cutover.json'
 TABLES = ('projection_projects', 'projection_threads', 'projection_thread_messages')
 NODE_BIN = Path.home() / '.local/share/t3-personal-tooling/node-v24.13.1-darwin-arm64/bin'
+PERSONAL_BUNDLE_ID = 'local.nafironato.t3code.personal-runtime'
+
+
+def prepare_runtime_identity(root):
+    """Keep Launch Services from resolving the Personal runtime to stock Alpha."""
+    if main_pids(root, 'Beta', processes()):
+        raise RuntimeError('Quit Personal before updating its macOS identity.')
+    bundle = electron(root, 'Beta').parents[2]
+    main_plist = bundle / 'Contents/Info.plist'
+    if not main_plist.exists():
+        raise RuntimeError(f'The Personal runtime is missing {main_plist}.')
+    files = [main_plist]
+    files.extend(sorted((bundle / 'Contents/Frameworks').glob('Electron Helper*.app/Contents/Info.plist')))
+    changed = False
+    for file in files:
+        original = file.read_bytes()
+        info = plistlib.loads(original)
+        if file == main_plist:
+            info['CFBundleIdentifier'] = PERSONAL_BUNDLE_ID
+            info['CFBundleName'] = 'T3 Code Personal'
+            info['CFBundleDisplayName'] = 'T3 Code Personal'
+            for handler in info.get('CFBundleURLTypes', []):
+                handler['CFBundleURLName'] = PERSONAL_BUNDLE_ID
+        else:
+            identifier = info.get('CFBundleIdentifier', '')
+            if identifier.startswith('com.t3tools.t3code.helper'):
+                info['CFBundleIdentifier'] = PERSONAL_BUNDLE_ID + identifier.removeprefix('com.t3tools.t3code')
+        if plistlib.loads(original) != info:
+            backup = root / '.t3/runtime-identity-backup' / file.relative_to(bundle)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if not backup.exists():
+                backup.write_bytes(original)
+            file.write_bytes(plistlib.dumps(info))
+            changed = True
+    if changed:
+        subprocess.run(['/usr/bin/codesign', '--force', '--deep', '--sign', '-', '--timestamp=none',
+                        str(bundle)], check=True, capture_output=True, text=True)
+    subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(bundle)],
+                   check=True, capture_output=True, text=True)
 
 
 def processes():
@@ -56,6 +96,9 @@ function run(args) {
 
 def require_stopped(previous_root, root, port):
     for _, command in processes():
+        if command == '/Applications/T3 Code (Alpha).app/Contents/MacOS/T3 Code (Alpha)':
+            raise RuntimeError('The original T3 Code (Alpha) is open and owns the connection port. '
+                               'Quit Alpha after its agents finish, then open T3 Code Personal from Applications.')
         for candidate, channel in ((previous_root, 'Alpha'), (root, 'Beta')):
             if (command.startswith(f'{electron(candidate, channel)} ')
                     or command == f'{NODE_BIN / "node"} {candidate / "apps/desktop/scripts/start-electron.mjs"}'
@@ -257,6 +300,7 @@ def launch(previous_root, root=ROOT, port=3773):
                          root / 'apps/server/dist/client/index.html'):
             if not required.is_file():
                 raise RuntimeError(f'The prepared build is missing {required}.')
+        prepare_runtime_identity(root)
         manifest = prepared_home(source, data, check_stopped)
         check_stopped()
         log_path = root / '.t3/personal-launch.log'

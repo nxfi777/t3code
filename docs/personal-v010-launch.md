@@ -6,6 +6,8 @@
 
 The old home stays intact. Existing v0.1.0 data is never overwritten or refreshed automatically. The copy preserves the environment ID and relay credentials so the mobile app can reconnect to the same environment. First launch can take longer while copying data and importing chats; copied credentials may prompt for Keychain access. Local readiness requires protocol 2 and the original environment ID; it does not verify the managed relay or the physical iPhone.
 
+Personal's native runtime uses its own macOS bundle identifier, separate from the stock Alpha app. The launcher restores this identity after a runtime rebuild and verifies the signature before starting. It keeps the legacy pre-ready Keychain name. If Alpha is still open, the launcher explains that Alpha must quit before Personal can use port 3773.
+
 For rollback, fully quit v0.1.0, then run the saved previous launcher. Never run the two copies of this environment together. New messages written in v0.1.0 do not appear in the old database; keep both homes, and reconcile any later rollback deliberately.
 
 ## Isolated staging launcher
